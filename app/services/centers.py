@@ -4,10 +4,29 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.models.institution import Center
 from app.models.user import StudentProfile, User
+
+
+def validate_center_for_institution(
+    db: Session,
+    center_id: str,
+    institution_id: str,
+    *,
+    allow_inactive: bool = False,
+) -> Center:
+    center = db.get(Center, center_id)
+    if not center or center.institution_id != institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Center not found")
+    if not allow_inactive and not center.active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Center is inactive. Assign students to an active branch.",
+        )
+    return center
 
 
 def student_counts_by_center(db: Session, institution_id: str) -> dict[str, int]:
@@ -38,7 +57,9 @@ def center_out_dict(db: Session, center: Center, institution_id: str) -> dict:
     return {
         "id": center.id,
         "name": center.name,
+        "code": center.code or center.id,
         "city": center.city or "",
+        "active": bool(center.active),
         "student_count": counts.get(center.id, 0),
         "batch_count": center.batch_count or 0,
     }

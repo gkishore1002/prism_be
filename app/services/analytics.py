@@ -14,6 +14,8 @@ from app.models.content import Batch, BatchStudent
 from app.models.institution import Center, Institution
 from app.models.user import StudentProfile, User
 from app.services import analytics_recompute as recompute_svc
+from app.services import topic_readiness as topic_readiness_svc
+from app.services.user_roles import filter_users_with_role
 from app.utils import from_json_list
 
 
@@ -38,17 +40,89 @@ def _students_for_institution(db: Session, institution_id: str) -> list[StudentP
     )
 
 
-def get_institution_overview(db: Session, institution_id: str) -> dict:
+def _students_for_scope(
+    db: Session,
+    institution_id: str,
+    center_ids: list[str] | None = None,
+) -> list[StudentProfile]:
     students = _students_for_institution(db, institution_id)
-    tutors = db.query(User).filter(User.institution_id == institution_id, User.role == "tutor").count()
+    if center_ids is not None:
+        students = [s for s in students if s.center_id in center_ids]
+    return students
+
+
+def get_institution_operational_stats(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> dict:
+    """CSC compliance and reassignment counts for institution dashboard."""
+    from app.models.csc import AssessmentAccessRequest
+    from app.services.csc_eligibility import days_until_csc_disable
+    from app.services.institution_policies import get_csc_policy
+
+    policy = get_csc_policy(db, institution_id)
+    students = _students_for_scope(db, institution_id, center_ids)
+    active_students = sum(1 for s in students if s.status == "active")
+    inactive_students = sum(1 for s in students if s.status == "inactive")
+    csc_inactive = sum(1 for s in students if s.disable_reason == "csc_inactivity")
+    csc_due_soon = 0
+    csc_never_visited = 0
+    for s in students:
+        if not s.last_csc_interaction_at:
+            csc_never_visited += 1
+            continue
+        days = days_until_csc_disable(s, db=db)
+        if days is not None and days <= policy.warning_threshold_days and s.status == "active":
+            csc_due_soon += 1
+
+    reqs = (
+        db.query(AssessmentAccessRequest)
+        .join(Assessment, Assessment.id == AssessmentAccessRequest.assessment_id)
+        .filter(Assessment.institution_id == institution_id)
+        .all()
+    )
+    centers_count = db.query(Center).filter(Center.institution_id == institution_id).count()
+    if center_ids is not None:
+        centers_count = len(center_ids)
+
+    return {
+        "totalStudents": len(students),
+        "activeStudents": active_students,
+        "inactiveStudents": inactive_students,
+        "totalCenters": centers_count,
+        "cscDueSoon": csc_due_soon,
+        "cscInactive": csc_inactive,
+        "cscNeverVisited": csc_never_visited,
+        "reassignmentPending": sum(1 for r in reqs if r.status == "pending"),
+        "reassignmentApproved": sum(1 for r in reqs if r.status == "approved"),
+        "reassignmentRejected": sum(1 for r in reqs if r.status == "rejected"),
+    }
+
+
+def get_institution_overview(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> dict:
+    students = _students_for_scope(db, institution_id, center_ids)
+    tutors = filter_users_with_role(
+        db.query(User).filter(User.institution_id == institution_id),
+        "tutor",
+    ).count()
     boards: dict[str, int] = defaultdict(int)
     for s in students:
-        boards[s.board] += 1
+        board_label = (s.board or "").strip() or "Unassigned"
+        boards[board_label] += 1
     health_scores = [s.health for s in students] or [0]
     readiness_scores = [s.readiness for s in students] or [0]
     improving = sum(1 for s in students if s.improving)
+    inst_dict = _institution_dict(db, institution_id)
+    inst_dict["studentCount"] = len(students)
     return {
-        "institution": _institution_dict(db, institution_id),
+        "institution": inst_dict,
         "totalStudents": len(students),
         "tutorCount": tutors,
         "byBoard": [{"board": b, "count": c} for b, c in boards.items()],
@@ -65,7 +139,10 @@ def _institution_dict(db: Session, institution_id: str) -> dict:
     if not inst:
         return {"id": institution_id, "name": "Institution", "type": "coaching", "boardIds": [], "studentCount": 0, "tutorCount": 0}
     students = _students_for_institution(db, institution_id)
-    tutors = db.query(User).filter(User.institution_id == institution_id, User.role == "tutor").count()
+    tutors = filter_users_with_role(
+        db.query(User).filter(User.institution_id == institution_id),
+        "tutor",
+    ).count()
     return {
         "id": inst.id,
         "name": inst.name,
@@ -137,7 +214,10 @@ def get_board_report(db: Session, institution_id: str) -> list[dict]:
 
 
 def get_teachers(db: Session, institution_id: str) -> list[dict]:
-    tutors = db.query(User).filter(User.institution_id == institution_id, User.role == "tutor").all()
+    tutors = filter_users_with_role(
+        db.query(User).filter(User.institution_id == institution_id),
+        "tutor",
+    ).all()
     students = _students_for_institution(db, institution_id)
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     assessments = (
@@ -371,21 +451,13 @@ def get_recovery_plan(db: Session, student_id: str) -> list[dict]:
 
 
 def get_readiness_predictions(db: Session, student_id: str) -> list[dict]:
-    profile = db.get(StudentProfile, student_id)
-    if not profile:
-        return []
-    subjects = _subjects_for_student(db, profile)
-    return [
-        {
-            "subjectId": s["subjectId"],
-            "subjectName": s["subjectName"],
-            "currentReadiness": profile.readiness,
-            "projectedReadiness": min(100, profile.readiness + 8),
-            "examDate": "2026-09-15",
-            "confidenceLevel": "high" if profile.improving else "medium",
-        }
-        for s in subjects[:3]
-    ]
+    """Subject readiness rolled up from per-topic predictive scores."""
+    return topic_readiness_svc.get_student_subject_readiness_predictions(db, student_id)
+
+
+def get_topic_readiness(db: Session, student_id: str) -> list[dict]:
+    """Per-topic forecast: current mastery → predicted exam score + confidence."""
+    return topic_readiness_svc.get_student_topic_readiness(db, student_id)
 
 
 def get_improvement_trend(db: Session, student_id: str) -> list[dict]:
@@ -400,6 +472,27 @@ def get_improvement_trend(db: Session, student_id: str) -> list[dict]:
 
 
 def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
+    """Topic mastery plus predictive readiness fields (backward compatible)."""
+    forecast = topic_readiness_svc.get_student_topic_readiness(db, student_id)
+    if forecast:
+        ranked = sorted(forecast, key=lambda t: t["predictedScore"], reverse=True)
+        return [
+            {
+                "topic": t["topic"],
+                "topicId": t["topicId"],
+                "subject": t["subject"],
+                "mastery": t["currentMastery"],
+                "currentMastery": t["currentMastery"],
+                "predictedScore": t["predictedScore"],
+                "delta": t["delta"],
+                "confidence": t["confidence"],
+                "attemptCount": t["attemptCount"],
+                "drivers": t["drivers"],
+                "status": t["status"],
+            }
+            for t in ranked[:8]
+        ]
+
     profile = db.get(StudentProfile, student_id)
     if not profile:
         return []
@@ -408,11 +501,18 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
     return [
         {
             "topic": t["topic"],
+            "topicId": t.get("topic_id"),
             "subject": t["subject"],
             "mastery": t["mastery"],
+            "currentMastery": t["mastery"],
+            "predictedScore": t["mastery"],
+            "delta": 0,
+            "confidence": "low",
+            "attemptCount": 0,
+            "drivers": ["no attempts yet"],
             "status": _health_status(t["mastery"]),
         }
-        for t in ranked[:6]
+        for t in ranked[:8]
     ]
 
 
@@ -550,10 +650,19 @@ def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
 
     from app.services import vertex_summary as vertex_svc
 
-    ai_summary = vertex_svc.generate_student_report_summary(context)
+    ai_summary, ai_summary_ta = vertex_svc.generate_pair_parallel(
+        vertex_svc.generate_student_report_summary,
+        vertex_svc.generate_student_report_summary_ta,
+        context,
+    )
     rule_insight = wise.get("insight") or (
         f"{profile.user.name} is {'improving' if profile.improving else 'needs support'} "
         f"with {profile.critical_gaps} critical gaps."
+    )
+    rule_insight_ta = (
+        f"{profile.user.name} அவர்களின் ஒட்டுமொத்த கற்றல் சுகாதாரம் {profile.health}% ஆக உள்ளது. "
+        f"{'முன்னேற்றம் உள்ளது' if profile.improving else 'கவனம் தேவை'}. "
+        f"{profile.critical_gaps} முக்கிய இடைவெளிகள் கண்டறியப்பட்டுள்ளன."
     )
 
     return {
@@ -580,6 +689,7 @@ def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
         "strongTopics": wise.get("strongTopics", []),
         "weakTopics": wise.get("weakTopics", []),
         "summary": ai_summary or rule_insight,
+        "summaryTa": ai_summary_ta or rule_insight_ta,
         "summarySource": "vertex" if ai_summary else "rule-based",
         "reportType": "overall",
     }
@@ -678,12 +788,24 @@ def get_tutor_topic_weakness(
     topics = _topic_mastery_rows(db, institution_id, student_ids=student_ids)
     with_data = [t for t in topics if t["mastery"] > 0]
     weak = sorted(with_data or topics, key=lambda t: t["mastery"])[:5]
+
+    # Average predicted scores across batch students for weak topics
+    predicted_by_topic: dict[str, list[int]] = defaultdict(list)
+    for sid in student_ids or []:
+        for row in topic_readiness_svc.compute_topic_readiness(
+            db, institution_id, sid, only_with_attempts=True
+        ):
+            predicted_by_topic[row["topic"]].append(int(row["predictedScore"]))
+
     result = []
     for i, t in enumerate(weak):
+        preds = predicted_by_topic.get(t["topic"], [])
+        avg_predicted = round(mean(preds)) if preds else t["mastery"]
         result.append({
             "rank": i + 1,
             "topic": t["topic"],
             "avgMastery": t["mastery"],
+            "avgPredictedScore": avg_predicted,
             "suggestedNextClass": f"Level Up: {t['topic']} Mastery",
             "expectedGain": max(4, 10 - i * 2),
         })
@@ -886,7 +1008,10 @@ def get_subject_students(db: Session, institution_id: str, subject: str) -> list
 
 
 def get_tutor_name_map(db: Session, institution_id: str) -> dict[str, str]:
-    tutors = db.query(User).filter(User.institution_id == institution_id, User.role == "tutor").all()
+    tutors = filter_users_with_role(
+        db.query(User).filter(User.institution_id == institution_id),
+        "tutor",
+    ).all()
     return {t.id: t.name for t in tutors}
 
 
@@ -929,6 +1054,7 @@ def get_admin_dashboard(db: Session, institution_id: str) -> dict:
     """All admin analytics in one payload."""
     return {
         "overview": get_institution_overview(db, institution_id),
+        "operationalStats": get_institution_operational_stats(db, institution_id),
         "tutorNames": get_tutor_name_map(db, institution_id),
         "centers": get_centers_analytics(db, institution_id),
         "boardReport": get_board_report(db, institution_id),
@@ -947,6 +1073,8 @@ def get_admin_dashboard(db: Session, institution_id: str) -> dict:
 
 
 def get_student_master_profiles(db: Session, institution_id: str) -> list[dict]:
+    from app.services.csc_eligibility import days_until_csc_disable
+
     students = _students_for_institution(db, institution_id)
     result = []
     for s in students:
@@ -967,6 +1095,9 @@ def get_student_master_profiles(db: Session, institution_id: str) -> list[dict]:
                 "schoolName": s.school_name,
                 "email": s.user.email,
                 "status": s.status,
+                "lastCscInteractionAt": s.last_csc_interaction_at,
+                "disableReason": s.disable_reason,
+                "daysUntilCscDisable": days_until_csc_disable(s, db=db),
             }
         )
     return result

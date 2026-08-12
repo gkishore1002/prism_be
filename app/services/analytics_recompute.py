@@ -56,6 +56,11 @@ def student_score_events(db: Session, institution_id: str, student_id: str) -> l
                 "subject": row.subject,
                 "date": row.conducted_on,
                 "source": "marks",
+                "title": row.assessment_title,
+                "scored": float(row.scored_marks),
+                "maxMarks": int(row.max_marks),
+                "assessmentId": None,
+                "sessionId": row.session_id,
             }
         )
 
@@ -79,6 +84,11 @@ def student_score_events(db: Session, institution_id: str, student_id: str) -> l
                 "subject": assessment.subject,
                 "date": sub.submitted_at,
                 "source": "assessment",
+                "title": assessment.title,
+                "scored": float(sub.score),
+                "maxMarks": int(sub.max_score),
+                "assessmentId": assessment.id,
+                "sessionId": assessment.id,
             }
         )
 

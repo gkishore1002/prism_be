@@ -1,84 +1,156 @@
-# Prism Backend (prism_be)
+# Prism Backend (`prism_be`)
 
-FastAPI CRUD backend for the [prism_fe](../prism_fe) Prism frontend.
+FastAPI API for [prism_fe](../prism_fe). JSON uses **camelCase** on the wire.
 
-## Quick start
+**Full stack setup (Docker + frontend):** see the [root README](../README.md).
 
-```bash
+---
+
+## Run with Docker (recommended)
+
+Postgres + API only — run the frontend separately.
+
+```powershell
+cd c:\Current
+docker compose -f docker-compose.backend.yml up -d --build
+```
+
+- API: http://127.0.0.1:8002  
+- OpenAPI: http://127.0.0.1:8002/docs  
+- Health: http://127.0.0.1:8002/health  
+
+Set `prism_fe/.env`:
+
+```env
+VITE_API_BASE_URL=http://127.0.0.1:8002/api/v1
+```
+
+---
+
+## Run locally (SQLite, no Docker)
+
+```powershell
 cd c:\Current\prism_be
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
-python -m app.seed
 uvicorn app.main:app --reload --port 8000
 ```
 
-API docs: http://localhost:8000/docs
+Then point the frontend at port **8000**:
 
-## Demo credentials
-
-| Email | Role | Password | Institution code |
-|-------|------|----------|------------------|
-| arjun@brightpath.edu | student | demo123 | BRIGHTPATH |
-| priya@brightpath.edu | tutor | demo123 | BRIGHTPATH |
-| rajesh@brightpath.edu | admin | demo123 | BRIGHTPATH |
-| demo@prism.app | multi-role picker | demo123 | BRIGHTPATH |
-
-## API modules (no AI)
-
-| Module | Prefix | CRUD |
-|--------|--------|------|
-| Auth | `/api/v1/auth` | login, select-role, me, logout |
-| Institutions | `/api/v1/institutions`, `/api/v1/centers` | read + create/update/delete centers |
-| Curriculum | `/api/v1/curriculum` | boards, grades, subjects, topics (read, create, update, delete) |
-| Students | `/api/v1/students` | list, get, create, update, delete |
-| Batches | `/api/v1/batches` | list, get, create, update, delete, assign students |
-| Questions | `/api/v1/questions` | full CRUD, bulk paper import |
-| Question papers | `/api/v1/question-papers` | list, get, create, bulk, custom, delete |
-| Search | `/api/v1/search` | students, topics, questions, papers |
-| Assessments | `/api/v1/assessments` | CRUD, submit, attendance |
-| Study plans | `/api/v1/study-plans` | CRUD, toggle day done |
-| Notifications | `/api/v1/notifications` | list, create, mark read, delete one, clear all |
-
-## FE integration
-
-Add to `prism_fe`:
-
-```
-VITE_API_BASE_URL=http://localhost:8000/api/v1
+```env
+VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1
 ```
 
-All request/response JSON uses **camelCase** field names (e.g. `institutionId`, `durationMinutes`, `questionIds`) to match the TypeScript types. Snake_case is also accepted on input.
+SQLite file: `prism.db` in this folder (delete it to reset).
+
+---
+
+## Authentication
+
+Login: `POST /api/v1/auth/login`
+
+```json
+{
+  "email": "9876543210@gmail.com",
+  "password": "9876543210",
+  "institutionCode": "DEMO001"
+}
+```
+
+| User source | Email | Password |
+|-------------|-------|----------|
+| **Seeded demo** (`SEED_DEMO=true`) | `admin@demo.com`, `tutor@demo.com`, etc. | `demo1234` |
+| **Platform super user** (seed) | `superuser@prism.io` | `superuser123` — org code `SYSTEM` |
+| **Created in admin UI** | `{phone}@gmail.com` | Phone number, or custom password at creation |
+| **First-run `/setup`** | `{owner phone}@gmail.com` | Phone number, or custom password at setup |
+
+Creating users (`POST /admins`, `/tutors`, `/students`) takes a **phone** and optional **password**; email is derived on the server.
+
+---
+
+## Database modes
+
+| `DATABASE_URL` | Mode |
+|----------------|------|
+| `sqlite:///./prism.db` | Single-schema dev (default in `.env.example`) |
+| `postgresql+psycopg://...` | Production-style; **one Postgres schema per organization** when multi-schema is enabled |
+
+### Fresh database
+
+**Option A — Demo seed (default)**  
+`SEED_DEMO=true` → platform super user + `DEMO001` org on startup. No `/setup` needed.
+
+**Option B — Custom first org**  
+`SEED_DEMO=false`, empty DB → frontend redirects to `/setup` → org owner with phone-based login.  
+`/api/v1/setup` is disabled after the deployment is marked initialized.
+
+**Reset**
+
+```powershell
+# Docker Postgres
+cd c:\Current
+docker compose -f docker-compose.backend.yml down -v
+docker compose -f docker-compose.backend.yml up -d --build
+
+# SQLite
+Remove-Item c:\Current\prism_be\prism.db
+```
+
+---
+
+## Environment (`.env`)
+
+Copy from [`.env.example`](.env.example):
+
+| Variable | Default | Notes |
+|----------|---------|--------|
+| `DATABASE_URL` | SQLite | Use Postgres URL in Docker (set in compose) |
+| `SECRET_KEY` | dev placeholder | Change in production |
+| `SEED_DEMO` | `true` | Idempotent demo platform + DEMO001 tenant |
+| `AUTO_BOOTSTRAP` | `false` | Legacy; use `SEED_DEMO` instead |
+| `DEFAULT_ORGANIZATION_CODE` | `CSC` | Pre-fill on `/setup` |
+| `CORS_ORIGINS` | localhost:5173/5174 | Must include your Vite origin |
+
+Seed credentials are documented in `.env.example` (dev only).
+
+---
+
+## API overview
+
+| Area | Prefix |
+|------|--------|
+| Auth | `/api/v1/auth` |
+| Setup | `/api/v1/setup` |
+| Platform | `/api/v1/platform` |
+| Admins | `/api/v1/admins` |
+| Institutions / centers | `/api/v1/institutions`, `/api/v1/centers` |
+| Curriculum / students | `/api/v1/curriculum`, `/api/v1/students` |
+| Assessments | `/api/v1/assessments` |
+| Analytics | `/api/v1/analytics` |
+
+---
 
 ## Project layout
 
-```
+```text
 prism_be/
 ├── app/
-│   ├── main.py          # FastAPI entry
-│   ├── seed.py          # Demo data
-│   ├── api/v1/          # Route handlers
-│   ├── core/            # Config, JWT, deps
-│   ├── db/              # SQLAlchemy session
-│   ├── models/          # DB tables
-│   └── schemas/         # Pydantic (mirrors FE types)
+│   ├── main.py
+│   ├── api/v1/
+│   ├── core/           # config, JWT, deps
+│   ├── db/             # session, tenant schemas
+│   ├── models/
+│   ├── services/       # business logic (incl. user_credentials.py)
+│   └── schemas/
 ├── requirements.txt
 └── .env.example
 ```
 
-## Database
+---
 
-SQLite by default (`prism.db`). Set `DATABASE_URL` in `.env` for PostgreSQL.
+## Customer deployments
 
-### Fresh database (no seed)
-
-Delete `prism.db` and restart uvicorn. On first startup the API **auto-bootstraps**:
-
-- Institution code: `BRIGHTPATH` (configurable via `BOOTSTRAP_INST_CODE` in `.env`)
-- Default HQ center (for student assignment — not used at login)
-- Admin / tutor / student logins with password `demo123`
-
-Login uses **institution code**, not center ID.
-
-Manual bootstrap: `python -m app.bootstrap --inst-code MYACAD ...`
+Use [`docker-compose.customer.yml`](../docker-compose.customer.yml) as a template: one deployment + one Postgres database per customer. Run `/setup` once per customer DB — do not share a single database across customers.

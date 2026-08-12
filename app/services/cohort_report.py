@@ -97,6 +97,10 @@ def _score_events_for_cohort(
                 "subjectCode": _subject_code(row.subject),
                 "pct": row.percentage,
                 "source": "marks",
+                "title": row.assessment_title,
+                "scored": float(row.scored_marks),
+                "maxMarks": int(row.max_marks),
+                "sessionId": row.session_id,
             }
         )
 
@@ -120,7 +124,12 @@ def _score_events_for_cohort(
                 "subjectCode": _subject_code(assessment.subject),
                 "pct": pct,
                 "source": "assessment",
+                "title": assessment.title,
                 "assessmentTitle": assessment.title,
+                "scored": float(sub.score),
+                "maxMarks": int(sub.max_score),
+                "assessmentId": assessment.id,
+                "sessionId": assessment.id,
             }
         )
 
@@ -161,6 +170,140 @@ def _student_assessment_attendance(
     absent = max(0, invited - submitted)
     pct = round((submitted / invited) * 100) if invited else 100
     return pct, absent
+
+
+def _pct_grade(pct: float) -> str:
+    if pct >= 90:
+        return "A+"
+    if pct >= 80:
+        return "A"
+    if pct >= 70:
+        return "B+"
+    if pct >= 60:
+        return "B"
+    if pct >= 50:
+        return "C"
+    if pct >= 40:
+        return "D"
+    return "E"
+
+
+def _exam_bundles(events: list[dict]) -> list[dict]:
+    """Group score events into assessment/exam windows (title + date)."""
+    bundles: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for ev in events:
+        title = str(ev.get("title") or "Assessment")
+        date_label = ev.get("dateLabel") or _parse_date_label(str(ev.get("date", "")))
+        key = (title, date_label)
+        if key not in bundles:
+            bundles[key] = {
+                "title": title,
+                "date": date_label,
+                "dateRaw": str(ev.get("date", "")),
+                "assessmentId": ev.get("assessmentId"),
+                "sessionId": ev.get("sessionId"),
+                "subjects": [],
+            }
+            order.append(key)
+        bundles[key]["subjects"].append(
+            {
+                "name": ev["subject"],
+                "code": ev.get("subjectCode") or _subject_code(ev["subject"]),
+                "pct": ev["pct"],
+                "scored": ev.get("scored"),
+                "maxMarks": ev.get("maxMarks"),
+                "grade": _pct_grade(ev["pct"]),
+            }
+        )
+
+    exams: list[dict] = []
+    prev_overall: float | None = None
+    for key in order:
+        bundle = bundles[key]
+        pcts = [s["pct"] for s in bundle["subjects"]]
+        overall = round(mean(pcts), 1) if pcts else 0.0
+        vs_prev = None if prev_overall is None else round(overall - prev_overall, 1)
+        exams.append(
+            {
+                **bundle,
+                "overall": overall,
+                "subjectCount": len(bundle["subjects"]),
+                "vsPrev": vs_prev,
+            }
+        )
+        prev_overall = overall
+    return exams
+
+
+def _class_avg_for_subject(
+    db: Session,
+    institution_id: str,
+    *,
+    batch_id: str | None,
+    subject: str,
+    title: str,
+    date_label: str,
+) -> float | None:
+    """Average % across batch peers for the same assessment window + subject."""
+    if not batch_id:
+        return None
+    peer_ids = _batch_student_ids(db, batch_id)
+    if not peer_ids:
+        return None
+    scores: list[int] = []
+    for sid in peer_ids:
+        from app.services.analytics_recompute import student_score_events
+
+        for ev in student_score_events(db, institution_id, sid):
+            ev_title = str(ev.get("title") or "Assessment")
+            ev_date = _parse_date_label(str(ev.get("date", "")))
+            if (
+                ev_title == title
+                and ev_date == date_label
+                and ev["subject"].strip().lower() == subject.strip().lower()
+            ):
+                scores.append(int(ev["pct"]))
+    if not scores:
+        return None
+    return round(mean(scores), 1)
+
+
+def _enrich_latest_assessment(
+    db: Session,
+    institution_id: str,
+    exams: list[dict],
+    *,
+    batch_id: str | None,
+) -> dict | None:
+    if not exams:
+        return None
+    latest = exams[-1]
+    subjects = []
+    for row in latest["subjects"]:
+        class_avg = _class_avg_for_subject(
+            db,
+            institution_id,
+            batch_id=batch_id,
+            subject=row["name"],
+            title=latest["title"],
+            date_label=latest["date"],
+        )
+        vs_class = None if class_avg is None else round(row["pct"] - class_avg, 1)
+        subjects.append(
+            {
+                **row,
+                "classAvg": class_avg,
+                "vsClass": vs_class,
+            }
+        )
+    return {
+        "title": latest["title"],
+        "date": latest["date"],
+        "assessmentId": latest.get("assessmentId"),
+        "subjects": subjects,
+        "overall": latest["overall"],
+    }
 
 
 def _build_student_profile(
@@ -226,9 +369,16 @@ def _build_student_profile(
     ][:3]
 
     daily_curve = [
-        {"date": e["dateLabel"], "subject": e["subjectCode"], "score": e["pct"]}
-        for e in events[-10:]
+        {
+            "date": e["dateLabel"],
+            "subject": e["subjectCode"],
+            "score": e["pct"],
+            "title": e.get("title") or "Assessment",
+        }
+        for e in events[-12:]
     ]
+
+    exams = _exam_bundles(events)
 
     return {
         "overall": overall,
@@ -253,6 +403,7 @@ def _build_student_profile(
         "growthPotential": min(99, max(5, round(velocity * 3 + (100 - overall) * 0.4))),
         "confidence": overall,
         "dailyCurve": daily_curve,
+        "examHistory": exams,
         "rank": rank,
         "studentId": profile.id,
         "scoreSources": sorted({e["source"] for e in events}),
@@ -418,6 +569,11 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
             "subjectCode": _subject_code(event["subject"]),
             "pct": event["pct"],
             "source": event["source"],
+            "title": event.get("title") or "Assessment",
+            "scored": event.get("scored"),
+            "maxMarks": event.get("maxMarks"),
+            "assessmentId": event.get("assessmentId"),
+            "sessionId": event.get("sessionId"),
         }
         for event in raw_events
     ]
@@ -448,6 +604,13 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         genome["rank"] = rank
         total = max(cohort_report.get("meta", {}).get("batchStudentCount", total), 1)
 
+    genome["latestAssessment"] = _enrich_latest_assessment(
+        db,
+        institution_id,
+        genome.get("examHistory") or [],
+        batch_id=batch.id if batch else None,
+    )
+
     from app.services import vertex_summary as vertex_svc
 
     narrative_context = {
@@ -456,7 +619,15 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         "totalStudents": max(total, 1),
         "profile": genome,
     }
-    ai_narrative = vertex_svc.generate_student_genome_narrative(narrative_context)
+    ai_narrative, ai_narrative_ta = vertex_svc.generate_pair_parallel(
+        vertex_svc.generate_student_genome_narrative,
+        vertex_svc.generate_student_genome_narrative_ta,
+        narrative_context,
+    )
+    rule_narrative_ta = (
+        f"{profile.user.name} அவர்களின் ஒட்டுமொத்த மதிப்பெண் {genome.get('overall', 0)}% ஆகும். "
+        f"வகுப்பில் #{rank} இடம். விரிவான பகுப்பாய்வுக்கு CSC மையத்தை அணுகவும்."
+    )
 
     return {
         "name": profile.user.name,
@@ -465,5 +636,6 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         "batchLabel": f"{profile.batch} · {profile.board} · {profile.grade}" if profile.batch else None,
         "source": "live",
         "narrative": ai_narrative,
+        "narrativeTa": ai_narrative_ta or rule_narrative_ta,
         "narrativeSource": "vertex" if ai_narrative else "rule-based",
     }

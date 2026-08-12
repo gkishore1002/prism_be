@@ -1,6 +1,6 @@
 """Seed the database with demo data matching prism_fe mocks."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.core.config import settings
 from app.core.security import hash_password
@@ -10,12 +10,154 @@ import app.models  # noqa: F401
 from app.models.academic import Board, Chapter, Grade, Question, Subject, Topic
 from app.models.assessment import Assessment, AssessmentSubmission
 from app.models.content import Batch, BatchStudent, QuestionPaper
+from app.models.csc import ReportCollectionLog
+from app.models.branch_access import UserCenterAccess
 from app.models.institution import Center, Institution
 from app.models.notification import Notification
 from app.models.user import StudentProfile, User
 from app.utils import to_json_list
 
 INST_ID = "inst-1"
+CSC_TEST_STUDENT_ID = "stu-csc-test"
+CSC_TEST_EMAIL = "csc.lapsed@brightpath.edu"
+CSC_LAPSED_DAYS = 95
+
+
+def ensure_csc_inactivity_demo(db) -> None:
+    """Upsert a student whose last CSC visit was 95+ days ago (login blocked as student)."""
+    institution = db.get(Institution, INST_ID)
+    if not institution:
+        return
+
+    pwd = hash_password(settings.demo_password)
+    lapsed_on = (date.today() - timedelta(days=CSC_LAPSED_DAYS)).isoformat()
+    collected_at = f"{lapsed_on}T10:00"
+
+    user = db.get(User, CSC_TEST_STUDENT_ID)
+    if not user:
+        db.add(
+            User(
+                id=CSC_TEST_STUDENT_ID,
+                institution_id=INST_ID,
+                name="CSC Lapsed Test",
+                email=CSC_TEST_EMAIL,
+                password_hash=pwd,
+                role="student",
+                grade_id="g8",
+                board_id="cbse",
+            )
+        )
+
+    profile = db.get(StudentProfile, CSC_TEST_STUDENT_ID)
+    if not profile:
+        db.add(
+            StudentProfile(
+                id=CSC_TEST_STUDENT_ID,
+                user_id=CSC_TEST_STUDENT_ID,
+                board="CBSE",
+                grade="Grade 8",
+                batch="Batch A",
+                center_id="c1",
+                health=62,
+                health_status="fair",
+                readiness=58,
+                last_assessment="2025-10-01",
+                critical_gaps=2,
+                improving=False,
+                status="active",
+                disable_reason=None,
+                last_csc_interaction_at=lapsed_on,
+            )
+        )
+    else:
+        profile.status = "active"
+        profile.disable_reason = None
+        profile.last_csc_interaction_at = lapsed_on
+
+    batch = db.get(Batch, "batch-a")
+    if batch:
+        existing = (
+            db.query(BatchStudent)
+            .filter(
+                BatchStudent.batch_id == "batch-a",
+                BatchStudent.student_id == CSC_TEST_STUDENT_ID,
+            )
+            .first()
+        )
+        if not existing:
+            db.add(BatchStudent(batch_id="batch-a", student_id=CSC_TEST_STUDENT_ID))
+
+    log = db.get(ReportCollectionLog, "rcl-csc-test")
+    if not log:
+        db.add(
+            ReportCollectionLog(
+                id="rcl-csc-test",
+                student_id=CSC_TEST_STUDENT_ID,
+                report_kind="monthly",
+                report_ref="seed-csc-lapsed",
+                collected_at=collected_at,
+                collected_by_user_id="tut-1",
+                guardian_name="Test Guardian",
+                notes="Seed data — CSC visit over 90 days ago for login-disable testing.",
+            )
+        )
+
+    db.commit()
+    print(
+        f"CSC inactivity test student ready:\n"
+        f"  Email: {CSC_TEST_EMAIL}\n"
+        f"  Password: {settings.demo_password}\n"
+        f"  Institution: {institution.code}\n"
+        f"  Last CSC visit: {lapsed_on} ({CSC_LAPSED_DAYS} days ago)\n"
+        f"  Expected: student login blocked with CSC inactivity message."
+    )
+
+
+def ensure_branch_access_demo(db) -> None:
+    """Upsert multi-branch admin demo users on existing installations."""
+    institution = db.get(Institution, INST_ID)
+    if not institution:
+        return
+    pwd = hash_password(settings.demo_password)
+    owner = db.get(User, "adm-1")
+    if owner and owner.role == "admin":
+        owner.is_owner = True
+
+    for uid, name, email, centers in [
+        ("adm-ravi", "Ravi Admin", "ravi@brightpath.edu", ["c1", "c2"]),
+        ("adm-priya", "Priya Admin", "priya.admin@brightpath.edu", ["c3"]),
+    ]:
+        user = db.get(User, uid)
+        if not user:
+            db.add(
+                User(
+                    id=uid,
+                    institution_id=INST_ID,
+                    name=name,
+                    email=email,
+                    password_hash=pwd,
+                    role="admin",
+                    roles="admin",
+                    is_owner=False,
+                )
+            )
+        for center_id in centers:
+            exists = (
+                db.query(UserCenterAccess)
+                .filter(UserCenterAccess.user_id == uid, UserCenterAccess.center_id == center_id)
+                .first()
+            )
+            if not exists:
+                db.add(
+                    UserCenterAccess(
+                        id=f"uca-{uid}-{center_id}",
+                        user_id=uid,
+                        center_id=center_id,
+                        created_at="2026-01-01T00:00:00+00:00",
+                        created_by="adm-1",
+                    )
+                )
+    db.commit()
 
 
 def seed() -> None:
@@ -23,7 +165,9 @@ def seed() -> None:
     db = SessionLocal()
     try:
         if db.get(Institution, INST_ID):
-            print("Database already seeded — skipping.")
+            ensure_csc_inactivity_demo(db)
+            ensure_branch_access_demo(db)
+            print("Database already seeded — CSC test student and branch admins ensured.")
             return
 
         pwd = hash_password(settings.demo_password)
@@ -39,19 +183,27 @@ def seed() -> None:
         )
 
         for c in [
-            ("c1", "BrightPath · Andheri (HQ)", "Mumbai", 980),
-            ("c2", "BrightPath · Borivali", "Borivali", 620),
-            ("c3", "BrightPath · Thane", "Thane", 410),
+            ("c1", "BrightPath · Andheri (HQ)", "Mumbai", "CHENNAI", 980),
+            ("c2", "BrightPath · Borivali", "Borivali", "BANGALORE", 620),
+            ("c3", "BrightPath · Thane", "Thane", "COIMBATORE", 410),
         ]:
-            db.add(Center(id=c[0], institution_id=INST_ID, name=c[1], city=c[2], student_count=c[3]))
+            db.add(Center(id=c[0], institution_id=INST_ID, name=c[1], city=c[2], code=c[3], student_count=c[4]))
 
         users = [
             User(id="stu-1", institution_id=INST_ID, name="Arjun Mehta", email="arjun@brightpath.edu", password_hash=pwd, role="student", roles="student", grade_id="g8", board_id="cbse"),
             User(id="tut-1", institution_id=INST_ID, name="Priya Sharma", email="priya@brightpath.edu", password_hash=pwd, role="tutor", roles="tutor"),
-            User(id="adm-1", institution_id=INST_ID, name="Rajesh Kumar", email="rajesh@brightpath.edu", password_hash=pwd, role="admin", roles="admin"),
+            User(id="adm-1", institution_id=INST_ID, name="Rajesh Kumar", email="rajesh@brightpath.edu", password_hash=pwd, role="admin", roles="admin", is_owner=True),
+            User(id="adm-ravi", institution_id=INST_ID, name="Ravi Admin", email="ravi@brightpath.edu", password_hash=pwd, role="admin", roles="admin", is_owner=False),
+            User(id="adm-priya", institution_id=INST_ID, name="Priya Admin", email="priya.admin@brightpath.edu", password_hash=pwd, role="admin", roles="admin", is_owner=False),
             User(id="demo-1", institution_id=INST_ID, name="Demo User", email="demo@prism.app", password_hash=pwd, role="student", roles="student,tutor,admin"),
         ]
         db.add_all(users)
+
+        db.add_all([
+            UserCenterAccess(id="uca-ravi-c1", user_id="adm-ravi", center_id="c1", created_at="2026-01-01T00:00:00+00:00", created_by="adm-1"),
+            UserCenterAccess(id="uca-ravi-c2", user_id="adm-ravi", center_id="c2", created_at="2026-01-01T00:00:00+00:00", created_by="adm-1"),
+            UserCenterAccess(id="uca-priya-c3", user_id="adm-priya", center_id="c3", created_at="2026-01-01T00:00:00+00:00", created_by="adm-1"),
+        ])
 
         extra_students = [
             ("stu-2", "Sneha Patel", "sneha@brightpath.edu"),
@@ -172,6 +324,7 @@ def seed() -> None:
         ])
 
         db.commit()
+        ensure_csc_inactivity_demo(db)
         print("Database seeded successfully.")
         print("Demo login: arjun@brightpath.edu / demo123 (institution code: BRIGHTPATH)")
     finally:

@@ -5,6 +5,11 @@ from app.models.institution import Center, Institution
 from app.models.marks import MarksEntry
 from app.models.notification import Notification
 from app.models.tutor_settings import TutorDashboardSetting
+from app.models.csc import AssessmentAccessRequest, ReportCollectionLog
+from app.models.branch_access import UserCenterAccess
+from app.models.audit import AuditLog
+from app.models.deployment import SystemInitialization
+from app.models.super_admin import SuperAdmin
 from app.models.user import StudentProfile, User
 
 __all__ = [
@@ -12,6 +17,7 @@ __all__ = [
     "Center",
     "User",
     "StudentProfile",
+    "SuperAdmin",
     "Board",
     "Grade",
     "Subject",
@@ -27,4 +33,9 @@ __all__ = [
     "MarksEntry",
     "Notification",
     "TutorDashboardSetting",
+    "AssessmentAccessRequest",
+    "ReportCollectionLog",
+    "AuditLog",
+    "UserCenterAccess",
+    "SystemInitialization",
 ]

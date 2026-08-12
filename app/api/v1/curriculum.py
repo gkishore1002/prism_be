@@ -1,16 +1,33 @@
+import hashlib
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.deps import get_current_user, get_db, require_roles
+from app.core.deps import get_current_user, get_db, get_effective_role, get_token_payload, require_roles
 from app.core.pagination import PaginatedOut, paginate_query
 from app.core.routing import CamelCaseAPIRoute
 from app.core.security import hash_password
 from app.models.academic import Board, Chapter, Grade, Question, Subject, Topic
 from app.models.assessment import AssessmentSubmission
 from app.models.content import Batch, BatchStudent
+from app.models.csc import ReportCollectionLog
 from app.models.institution import Center
 from app.models.user import StudentProfile, User
+from app.services.csc_eligibility import days_until_csc_disable
+from app.services.student_master import (
+    apply_student_master_filters,
+    student_master_base_query,
+    student_master_stats,
+    student_profile_to_master_dict,
+)
+from app.services.centers import sync_center_counts, validate_center_for_institution
+from app.services.branch_access import (
+    assert_can_access_center,
+    assert_can_access_student,
+    apply_branch_scope_to_students,
+)
+from app.services.student_tracking import latest_collections_for_students
 from app.schemas import (
     AddBoardRequest,
     AddGradeRequest,
@@ -22,6 +39,7 @@ from app.schemas import (
     CurriculumTopicOut,
     StudentCreate,
     StudentMasterOut,
+    StudentMasterStatsOut,
     StudentSummaryOut,
     StudentUpdate,
     TutorBatchCreate,
@@ -35,23 +53,35 @@ from app.schemas import (
 
 router = APIRouter(tags=["curriculum", "students", "batches"], route_class=CamelCaseAPIRoute)
 
+_MAX_ROW_ID_LEN = 32
+
 
 def _slug(value: str) -> str:
     return value.lower().replace(" ", "-").replace("/", "-")
 
 
 def _unique_row_id(db: Session, model: type, base_id: str) -> str:
-    candidate = base_id
+    candidate = base_id[:_MAX_ROW_ID_LEN]
     suffix = 1
     while db.get(model, candidate):
-        candidate = f"{base_id}-{suffix}"
+        suffix_str = f"-{suffix}"
+        candidate = f"{base_id[: _MAX_ROW_ID_LEN - len(suffix_str)]}{suffix_str}"
         suffix += 1
     return candidate
 
 
+def _compact_row_id(db: Session, model: type, prefix: str, *parts: str) -> str:
+    """Build a stable row id that fits the String(32) columns."""
+    slug = "-".join(_slug(part) for part in parts if part)
+    base = f"{prefix}-{slug}" if slug else prefix
+    if len(base) > 24:
+        digest = hashlib.sha256(base.encode()).hexdigest()[:16]
+        base = f"{prefix}-{digest}"
+    return _unique_row_id(db, model, base)
+
+
 def _unique_subject_id(db: Session, grade_id: str, subject_name: str) -> str:
-    base = f"subj-{_slug(grade_id)}-{_slug(subject_name)}"
-    return _unique_row_id(db, Subject, base)
+    return _compact_row_id(db, Subject, "subj", grade_id, subject_name)
 
 
 def _build_curriculum_tree(db: Session, institution_id: str) -> list[CurriculumBoardOut]:
@@ -94,13 +124,23 @@ def _find_or_create_topic(
         .first()
     )
     if not board_row:
-        board_row = Board(id=f"board-{board.lower()}", institution_id=institution_id, name=board, code=board.upper())
+        board_row = Board(
+            id=_compact_row_id(db, Board, "board", board),
+            institution_id=institution_id,
+            name=board,
+            code=board.upper(),
+        )
         db.add(board_row)
         db.flush()
 
     grade_row = db.query(Grade).filter(Grade.board_id == board_row.id, Grade.name == grade).first()
     if not grade_row:
-        grade_row = Grade(id=f"grade-{grade.lower().replace(' ', '-')}", board_id=board_row.id, name=grade, level=8)
+        grade_row = Grade(
+            id=_compact_row_id(db, Grade, "grade", board_row.id, grade),
+            board_id=board_row.id,
+            name=grade,
+            level=8,
+        )
         db.add(grade_row)
         db.flush()
 
@@ -121,7 +161,7 @@ def _find_or_create_topic(
     )
     if not chapter_row:
         chapter_row = Chapter(
-            id=_unique_row_id(db, Chapter, f"ch-{_slug(subject_row.id)}"),
+            id=_compact_row_id(db, Chapter, "ch", subject_row.id, subject),
             subject_id=subject_row.id,
             name=subject,
             order=1,
@@ -134,7 +174,7 @@ def _find_or_create_topic(
     )
     if not topic_row:
         topic_row = Topic(
-            id=_unique_row_id(db, Topic, f"top-{_slug(chapter_row.id)}-{_slug(topic_name)}"),
+            id=_compact_row_id(db, Topic, "top", chapter_row.id, topic_name),
             chapter_id=chapter_row.id,
             name=topic_name,
         )
@@ -211,18 +251,22 @@ def _sync_student_batch_memberships(db: Session, student_id: str, batch_ids: lis
 
 
 def _student_master_out(db: Session, profile: StudentProfile) -> StudentMasterOut:
+    data = student_profile_to_master_dict(db, profile)
     return StudentMasterOut(
-        id=profile.id,
-        name=profile.user.name,
-        board=profile.board,
-        grade=profile.grade,
-        batch=profile.batch,
-        batch_ids=_student_batch_ids(db, profile.id),
-        center_id=profile.center_id,
-        academic_year=profile.academic_year,
-        school_name=profile.school_name,
-        email=profile.user.email,
-        status=profile.status,  # type: ignore[arg-type]
+        id=data["id"],
+        name=data["name"],
+        board=data["board"],
+        grade=data["grade"],
+        batch=data["batch"],
+        batch_ids=data["batchIds"],
+        center_id=data["centerId"],
+        academic_year=data["academicYear"],
+        school_name=data["schoolName"],
+        email=data["email"],
+        status=data["status"],  # type: ignore[arg-type]
+        last_csc_interaction_at=data["lastCscInteractionAt"],
+        disable_reason=data["disableReason"],
+        days_until_csc_disable=data["daysUntilCscDisable"],
     )
 
 
@@ -292,16 +336,27 @@ def add_board(
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> CurriculumBoardOut:
     name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Board name is required")
     if db.query(Board).filter(Board.institution_id == user.institution_id, Board.name == name).first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Board already exists")
     board = Board(
-        id=f"board-{name.lower().replace(' ', '-')}",
+        id=_compact_row_id(db, Board, "board", name),
         institution_id=user.institution_id,
         name=name,
         code=name.upper(),
     )
-    grade = Grade(id=f"grade-{name.lower()}-8", board_id=board.id, name="Grade 8", level=8)
-    subject = Subject(id=f"subj-{name.lower()}-math", grade_id=grade.id, name="Mathematics")
+    grade = Grade(
+        id=_compact_row_id(db, Grade, "grade", board.id, "Grade 8"),
+        board_id=board.id,
+        name="Grade 8",
+        level=8,
+    )
+    subject = Subject(
+        id=_unique_subject_id(db, grade.id, "Mathematics"),
+        grade_id=grade.id,
+        name="Mathematics",
+    )
     db.add_all([board, grade, subject])
     db.commit()
     return CurriculumBoardOut(board=name, grades=[CurriculumGradeOut(grade="Grade 8", subjects=[CurriculumSubjectOut(name="Mathematics", topics=[])])])
@@ -318,15 +373,18 @@ def add_grade(
         .filter(Board.institution_id == user.institution_id, Board.name == body.board)
         .first()
     )
+    grade_name = body.grade.strip()
+    if not grade_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Grade name is required")
     if not board:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Board not found")
-    if db.query(Grade).filter(Grade.board_id == board.id, Grade.name == body.grade).first():
+    if db.query(Grade).filter(Grade.board_id == board.id, Grade.name == grade_name).first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Grade already exists")
-    grade_id = _unique_row_id(db, Grade, f"grade-{_slug(board.id)}-{_slug(body.grade)}")
+    grade_id = _compact_row_id(db, Grade, "grade", board.id, grade_name)
     grade = Grade(
         id=grade_id,
         board_id=board.id,
-        name=body.grade,
+        name=grade_name,
         level=8,
     )
     subject = Subject(
@@ -336,7 +394,7 @@ def add_grade(
     )
     db.add_all([grade, subject])
     db.commit()
-    return {"status": "created"}
+    return {"status": "created", "grade": grade_name}
 
 
 @router.post("/curriculum/subjects", status_code=status.HTTP_201_CREATED)
@@ -353,9 +411,11 @@ def add_subject(
     grade = db.query(Grade).filter(Grade.board_id == board.id, Grade.name == body.grade).first()
     if not grade:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Grade not found")
-    if db.query(Subject).filter(Subject.grade_id == grade.id, Subject.name == body.subject).first():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Subject already exists")
     subject_name = body.subject.strip()
+    if not subject_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Subject name is required")
+    if db.query(Subject).filter(Subject.grade_id == grade.id, Subject.name == subject_name).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Subject already exists")
     subject = Subject(
         id=_unique_subject_id(db, grade.id, subject_name),
         grade_id=grade.id,
@@ -553,7 +613,22 @@ def delete_topic(
     db.commit()
 
 
-def _student_summary(profile: StudentProfile) -> StudentSummaryOut:
+def _student_summary(
+    db: Session,
+    profile: StudentProfile,
+    latest_log: ReportCollectionLog | None = None,
+    collector_name: str | None = None,
+) -> StudentSummaryOut:
+    if latest_log is None:
+        latest_log = (
+            db.query(ReportCollectionLog)
+            .filter(ReportCollectionLog.student_id == profile.id)
+            .order_by(ReportCollectionLog.collected_at.desc())
+            .first()
+        )
+    if latest_log and collector_name is None:
+        collector = db.get(User, latest_log.collected_by_user_id)
+        collector_name = collector.name if collector else latest_log.collected_by_user_id
     return StudentSummaryOut(
         id=profile.id,
         name=profile.user.name,
@@ -568,7 +643,35 @@ def _student_summary(profile: StudentProfile) -> StudentSummaryOut:
         batch=profile.batch,
         center_id=profile.center_id,
         academic_year=profile.academic_year,
+        last_csc_interaction_at=profile.last_csc_interaction_at,
+        days_until_csc_disable=days_until_csc_disable(profile, db=db),
+        last_collected_by_name=collector_name if latest_log else None,
+        last_collection_guardian_name=latest_log.guardian_name if latest_log else None,
     )
+
+
+def _student_summaries(db: Session, profiles: list[StudentProfile]) -> list[StudentSummaryOut]:
+    if not profiles:
+        return []
+    latest_by_student = latest_collections_for_students(db, [p.id for p in profiles])
+    collector_ids = {log.collected_by_user_id for log in latest_by_student.values()}
+    collectors: dict[str, str] = {}
+    if collector_ids:
+        for user in db.query(User).filter(User.id.in_(collector_ids)).all():
+            collectors[user.id] = user.name
+    return [
+        _student_summary(
+            db,
+            profile,
+            latest_log=latest_by_student.get(profile.id),
+            collector_name=(
+                collectors.get(latest_by_student[profile.id].collected_by_user_id)
+                if profile.id in latest_by_student
+                else None
+            ),
+        )
+        for profile in profiles
+    ]
 
 
 @router.get("/students", response_model=PaginatedOut[StudentSummaryOut] | list[StudentSummaryOut])
@@ -577,39 +680,92 @@ def list_students(
     grade: str | None = Query(None),
     batch: str | None = Query(None),
     center: str | None = Query(None),
+    search: str | None = Query(None),
     page: int | None = Query(None, ge=1),
     limit: int | None = Query(None, ge=1, le=200),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_roles("admin", "tutor")),
+    payload: dict = Depends(get_token_payload),
 ) -> PaginatedOut[StudentSummaryOut] | list[StudentSummaryOut]:
-    q = (
-        db.query(StudentProfile)
-        .join(User)
-        .filter(User.institution_id == user.institution_id)
+    role = get_effective_role(payload, user)
+    q = student_master_base_query(db, user.institution_id)
+    q = apply_branch_scope_to_students(q, db, user, role, center)
+    q = apply_student_master_filters(
+        q,
+        search=search,
+        center=center,
+        board=board,
+        grade=grade,
+        batch=batch,
+        institution_id=user.institution_id,
+        db=db,
     )
-    if board:
-        q = q.filter(StudentProfile.board.ilike(board))
-    if grade:
-        q = q.filter(StudentProfile.grade == grade)
-    if batch:
-        batch_row = (
-            db.query(Batch)
-            .filter(Batch.institution_id == user.institution_id, Batch.name == batch)
-            .first()
-        )
-        if batch_row:
-            q = q.join(BatchStudent, BatchStudent.student_id == StudentProfile.id).filter(
-                BatchStudent.batch_id == batch_row.id
-            )
-        else:
-            q = q.filter(StudentProfile.batch == batch)
-    if center:
-        q = q.filter(StudentProfile.center_id == center)
     if page is None and limit is None:
-        return [_student_summary(p) for p in q.all()]
+        profiles = q.all()
+        return _student_summaries(db, profiles)
     items, total, page_n, limit_n, pages = paginate_query(q, page or 1, limit)
     return PaginatedOut(
-        items=[_student_summary(p) for p in items],
+        items=_student_summaries(db, items),
+        total=total,
+        page=page_n,
+        limit=limit_n,
+        pages=pages,
+    )
+
+
+@router.get("/students/master/stats", response_model=StudentMasterStatsOut)
+def list_students_master_stats(
+    center: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "tutor")),
+    payload: dict = Depends(get_token_payload),
+) -> StudentMasterStatsOut:
+    role = get_effective_role(payload, user)
+    if center:
+        assert_can_access_center(db, user, role, center)
+        stats = student_master_stats(db, user.institution_id, center=center)
+    else:
+        q = apply_branch_scope_to_students(
+            student_master_base_query(db, user.institution_id), db, user, role, None
+        )
+        profiles = q.all()
+        total = len(profiles)
+        active = sum(1 for p in profiles if p.status == "active")
+        stats = {"total": total, "active": active, "inactive": total - active}
+    return StudentMasterStatsOut(**stats)
+
+
+@router.get("/students/master", response_model=PaginatedOut[StudentMasterOut])
+def list_students_master(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    search: str | None = Query(None),
+    center: str | None = Query(None),
+    status: str | None = Query(None),
+    board: str | None = Query(None),
+    grade: str | None = Query(None),
+    batch: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "tutor")),
+    payload: dict = Depends(get_token_payload),
+) -> PaginatedOut[StudentMasterOut]:
+    role = get_effective_role(payload, user)
+    q = student_master_base_query(db, user.institution_id)
+    q = apply_branch_scope_to_students(q, db, user, role, center)
+    q = apply_student_master_filters(
+        q,
+        search=search,
+        center=center,
+        status=status,
+        board=board,
+        grade=grade,
+        batch=batch,
+        institution_id=user.institution_id,
+        db=db,
+    )
+    items, total, page_n, limit_n, pages = paginate_query(q, page, limit)
+    return PaginatedOut(
+        items=[_student_master_out(db, p) for p in items],
         total=total,
         page=page_n,
         limit=limit_n,
@@ -622,10 +778,13 @@ def get_student(
     student_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
 ) -> StudentMasterOut:
     profile = db.get(StudentProfile, student_id)
-    if not profile or profile.user.institution_id != user.institution_id:
+    if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+    role = get_effective_role(payload, user)
+    assert_can_access_student(db, user, role, profile)
     return _student_master_out(db, profile)
 
 
@@ -634,9 +793,20 @@ def create_student(
     body: StudentCreate,
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> StudentMasterOut:
+    role = get_effective_role(payload, user)
     sid = f"stu-{len(db.query(StudentProfile).all()) + 10}"
-    email = body.email or f"{sid}@brightpath.edu"
+    if body.phone:
+        from app.services.user_credentials import resolve_user_credentials
+
+        email, password = resolve_user_credentials(phone=body.phone, password=body.password)
+        existing = db.query(User).filter(User.email == email).first()
+        if existing:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Phone number already registered")
+    else:
+        email = body.email or f"{sid}@brightpath.edu"
+        password = settings.demo_password
     center_id = body.center_id
     if not center_id:
         default_center = (
@@ -647,12 +817,15 @@ def create_student(
         )
         if default_center:
             center_id = default_center.id
+    if center_id:
+        validate_center_for_institution(db, center_id, user.institution_id)
+        assert_can_access_center(db, user, role, center_id)
     new_user = User(
         id=sid,
         institution_id=user.institution_id,
         name=body.name,
         email=email,
-        password_hash=hash_password(settings.demo_password),
+        password_hash=hash_password(password),
         role="student",
     )
     profile = StudentProfile(
@@ -685,7 +858,8 @@ def create_student(
     from app.services.centers import sync_center_counts
 
     sync_center_counts(db, user.institution_id, commit=True)
-    return get_student(sid, db, user)
+    profile = db.get(StudentProfile, sid)
+    return _student_master_out(db, profile)
 
 
 @router.patch("/students/{student_id}", response_model=StudentMasterOut)
@@ -694,10 +868,13 @@ def update_student(
     body: StudentUpdate,
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> StudentMasterOut:
     profile = db.get(StudentProfile, student_id)
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+    role = get_effective_role(payload, user)
+    assert_can_access_student(db, user, role, profile)
     if body.name:
         profile.user.name = body.name
     if body.board:
@@ -720,6 +897,8 @@ def update_student(
         else:
             profile.batch = body.batch
     if body.center_id is not None:
+        validate_center_for_institution(db, body.center_id, user.institution_id)
+        assert_can_access_center(db, user, role, body.center_id)
         profile.center_id = body.center_id
     if body.status:
         profile.status = body.status
@@ -727,7 +906,8 @@ def update_student(
     from app.services.centers import sync_center_counts
 
     sync_center_counts(db, user.institution_id, commit=True)
-    return get_student(student_id, db, user)
+    db.refresh(profile)
+    return _student_master_out(db, profile)
 
 
 @router.delete("/students/{student_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -735,10 +915,13 @@ def delete_student(
     student_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> None:
     profile = db.get(StudentProfile, student_id)
-    if not profile or profile.user.institution_id != user.institution_id:
+    if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+    role = get_effective_role(payload, user)
+    assert_can_access_student(db, user, role, profile)
     db.query(BatchStudent).filter(BatchStudent.student_id == student_id).delete()
     db.query(AssessmentSubmission).filter(AssessmentSubmission.student_id == student_id).delete()
     student_user = profile.user
@@ -807,7 +990,8 @@ def list_batch_students(
         .all()
     )
     by_id = {p.id: p for p in profiles}
-    return [_student_summary(by_id[sid]) for sid in student_ids if sid in by_id]
+    ordered = [by_id[sid] for sid in student_ids if sid in by_id]
+    return _student_summaries(db, ordered)
 
 
 @router.post("/batches", response_model=TutorBatchOut, status_code=status.HTTP_201_CREATED)

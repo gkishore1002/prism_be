@@ -33,6 +33,7 @@ def _assessment_dict(a: Assessment, *, student_submitted: bool = False) -> dict:
         question_count=a.question_count,
         duration_minutes=a.duration_minutes,
         scheduled_at=a.scheduled_at,
+        available_until=a.available_until or a.scheduled_at,
         status=a.status,  # type: ignore[arg-type]
         class_avg=a.class_avg,
         center_ids=from_json_list(a.center_ids),

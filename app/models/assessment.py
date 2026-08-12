@@ -2,13 +2,14 @@ from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.db.registry import institution_fk_target
 
 
 class Assessment(Base):
     __tablename__ = "assessments"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    institution_id: Mapped[str] = mapped_column(ForeignKey("institutions.id"))
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
     title: Mapped[str] = mapped_column(String(255))
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
@@ -19,6 +20,7 @@ class Assessment(Base):
     question_count: Mapped[int] = mapped_column(Integer, default=0)
     duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
     scheduled_at: Mapped[str] = mapped_column(String(32))
+    available_until: Mapped[str] = mapped_column(String(32), default="")
     status: Mapped[str] = mapped_column(String(16), default="scheduled")
     class_avg: Mapped[int | None] = mapped_column(Integer, nullable=True)
     center_ids: Mapped[str] = mapped_column(Text, default="[]")
@@ -73,5 +75,8 @@ class AssessmentStudentReport(Base):
     strong_topics: Mapped[str] = mapped_column(Text, default="[]")
     weak_topics: Mapped[str] = mapped_column(Text, default="[]")
     summary: Mapped[str] = mapped_column(Text, default="")
+    summary_ta: Mapped[str] = mapped_column(Text, default="")
+    student_message_en: Mapped[str] = mapped_column(Text, default="")
+    student_message_ta: Mapped[str] = mapped_column(Text, default="")
     summary_source: Mapped[str] = mapped_column(String(16), default="rule-based")
     computed_at: Mapped[str] = mapped_column(String(32))

@@ -1,7 +1,9 @@
 """Role resolution and validation for multi-role accounts."""
 
 from app.models.user import User
+from app.services.user_roles import get_allowed_roles as _get_allowed_roles
 
+# Legacy demo seed emails (BrightPath SQLite seed)
 DEDICATED_EMAIL_ROLES: dict[str, str] = {
     "arjun@brightpath.edu": "student",
     "priya@brightpath.edu": "tutor",
@@ -9,23 +11,16 @@ DEDICATED_EMAIL_ROLES: dict[str, str] = {
 }
 
 MULTI_ROLE_EMAIL = "demo@prism.app"
-ALL_ROLES = ("student", "tutor", "admin")
+LEGACY_DEMO_ROLES = ("student", "tutor", "admin")
 
 
 def get_allowed_roles(user: User) -> list[str]:
     email = user.email.strip().lower()
-    if email == MULTI_ROLE_EMAIL:
-        if user.roles:
-            parsed = [r.strip() for r in user.roles.split(",") if r.strip()]
-            return parsed if parsed else list(ALL_ROLES)
-        return list(ALL_ROLES)
-    if email in DEDICATED_EMAIL_ROLES:
+    if email == MULTI_ROLE_EMAIL and not user.roles:
+        return list(LEGACY_DEMO_ROLES)
+    if email in DEDICATED_EMAIL_ROLES and not user.roles:
         return [DEDICATED_EMAIL_ROLES[email]]
-    if user.roles:
-        parsed = [r.strip() for r in user.roles.split(",") if r.strip()]
-        if parsed:
-            return parsed
-    return [user.role]
+    return _get_allowed_roles(user)
 
 
 def validate_role_selection(user: User, role: str) -> None:

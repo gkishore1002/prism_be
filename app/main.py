@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import asyncio
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +11,31 @@ from app.core.config import settings
 from app.db.base import Base
 from app.db.migrate import run_migrations
 from app.db.session import SessionLocal, engine
+from app.services.deployment import backfill_initialization_for_legacy
 import app.models  # noqa: F401 — register models with Base
+
+logger = logging.getLogger(__name__)
+
+CSC_JOB_INTERVAL_SECONDS = 86_400
+
+
+async def _csc_scheduler_loop() -> None:
+    """Run CSC maintenance daily and once shortly after startup."""
+    from app.services.csc_scheduler import run_daily_csc_job
+
+    await asyncio.sleep(60)
+    while True:
+        db = SessionLocal()
+        try:
+            stats = run_daily_csc_job(db)
+            db.commit()
+            logger.info("CSC scheduler run completed: %s", stats)
+        except Exception:
+            logger.exception("CSC scheduler run failed")
+            db.rollback()
+        finally:
+            db.close()
+        await asyncio.sleep(CSC_JOB_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
@@ -18,7 +44,15 @@ async def lifespan(_: FastAPI):
     run_migrations(engine)
     db = SessionLocal()
     try:
-        bootstrap_if_empty(db)
+        from app.services.seed import print_seed_credentials, seed_demo_platform
+
+        if seed_demo_platform():
+            print_seed_credentials()
+        elif settings.seed_demo:
+            logger.info("Demo seed already present (super user + demo org)")
+        if settings.auto_bootstrap:
+            bootstrap_if_empty(db)
+        backfill_initialization_for_legacy(db)
         created = ensure_default_centers(db)
         if created:
             print(f"Created default HQ center for {created} institution(s) without centers.")
@@ -29,7 +63,19 @@ async def lifespan(_: FastAPI):
             print(f"Recomputed analytics for {updated} student profile(s).")
     finally:
         db.close()
-    yield
+
+    scheduler_task = None
+    if settings.csc_scheduler_enabled:
+        scheduler_task = asyncio.create_task(_csc_scheduler_loop())
+    try:
+        yield
+    finally:
+        if scheduler_task:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

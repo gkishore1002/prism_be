@@ -36,8 +36,31 @@ def resolve_student_id(
 # ─── Institution / Admin ─────────────────────────────────────────────────────
 
 @router.get("/institution/overview")
-def institution_overview(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> dict:
-    return svc.get_institution_overview(db, user.institution_id)
+def institution_overview(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> dict:
+    from app.services.branch_access import resolve_branch_filter
+
+    role = get_effective_role(payload, user)
+    scope = resolve_branch_filter(db, user, role, center_id)
+    return svc.get_institution_overview(db, user.institution_id, center_ids=scope)
+
+
+@router.get("/institution/operational-stats")
+def institution_operational_stats(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "tutor")),
+    payload: dict = Depends(get_token_payload),
+) -> dict:
+    from app.services.branch_access import resolve_branch_filter
+
+    role = get_effective_role(payload, user)
+    scope = resolve_branch_filter(db, user, role, center_id)
+    return svc.get_institution_operational_stats(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/centers")
@@ -128,6 +151,11 @@ def student_topic_breakdown(sid: str = Depends(resolve_student_id), db: Session 
     return svc.get_topic_breakdown(db, sid)
 
 
+@router.get("/student/topic-readiness")
+def student_topic_readiness(sid: str = Depends(resolve_student_id), db: Session = Depends(get_db)) -> list:
+    return svc.get_topic_readiness(db, sid)
+
+
 @router.get("/student/subjects")
 def student_subjects(sid: str = Depends(resolve_student_id), db: Session = Depends(get_db)) -> list:
     return svc.get_student_subjects(db, sid)
@@ -170,6 +198,20 @@ def student_assessment_report(
     from app.services.assessment_report import get_assessment_report
 
     data = get_assessment_report(db, assessment_id, sid)
+    if not data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment report not found")
+    return data
+
+
+@router.get("/student/assessment-reports/{assessment_id}/summary")
+def student_assessment_report_summary(
+    assessment_id: str,
+    sid: str = Depends(resolve_student_id),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.services.assessment_report import get_assessment_report_summary
+
+    data = get_assessment_report_summary(db, assessment_id, sid)
     if not data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment report not found")
     return data

@@ -29,6 +29,7 @@ from app.db.session import SessionLocal, engine
 import app.models  # noqa: F401
 from app.models.institution import Center, Institution
 from app.models.user import StudentProfile, User
+from app.services.deployment import mark_deployment_initialized
 from app.utils import to_json_list
 
 DEFAULT_CENTER_ID = "c1"
@@ -87,8 +88,12 @@ def _bootstrap_into_db(
             password_hash=pwd,
             role="admin",
             roles="admin",
+            is_owner=True,
         )
     )
+
+    db.flush()
+    mark_deployment_initialized(db, user_id="adm-1")
 
     if tutor_email:
         db.add(
@@ -253,11 +258,10 @@ def _print_credentials(
 ) -> None:
     print(prefix)
     print()
-    print("Login at http://localhost:5173/login")
-    print("  Use INSTITUTION CODE (not center ID):")
-    print(f"  Institution code : {code}")
-    print(f"  Password (all)   : {password}")
-    print(f"  Admin            : {admin_email.strip().lower()}")
+    print("Login at http://localhost:5174/login")
+    print("  Email + password (organization is determined by this deployment)")
+    print(f"  Organization code : {code} (internal — not required at login)")
+    print(f"  Super Admin       : {admin_email.strip().lower()}")
     if tutor_email:
         print(f"  Tutor            : {tutor_email.strip().lower()}")
     if student_email:

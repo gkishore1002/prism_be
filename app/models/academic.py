@@ -2,13 +2,14 @@ from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+from app.db.registry import institution_fk_target
 
 
 class Board(Base):
     __tablename__ = "boards"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    institution_id: Mapped[str] = mapped_column(ForeignKey("institutions.id"))
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
     name: Mapped[str] = mapped_column(String(128))
     code: Mapped[str] = mapped_column(String(32))
 
@@ -69,7 +70,7 @@ class Question(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     topic_id: Mapped[str] = mapped_column(ForeignKey("topics.id"))
-    institution_id: Mapped[str] = mapped_column(ForeignKey("institutions.id"))
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
     subject: Mapped[str] = mapped_column(String(128))

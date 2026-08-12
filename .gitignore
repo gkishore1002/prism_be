@@ -1,7 +1,35 @@
+# Python bytecode & caches
 __pycache__/
 *.py[cod]
-.env
-.venv/
-venv/
+*$py.class
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets & local config (keep .env.example in git)
+.env
+.env.*
+!.env.example
+
+# Local SQLite database
+*.db
+*.db.backup
+prism.db
+
+# Logs
+*.log
+logs/
+
+# Editor & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -141,7 +141,7 @@ def _persist_question(db: Session, institution_id: str, body: QuestionCreate) ->
 def create_question(
     body: QuestionCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionOut:
     question = _persist_question(db, user.institution_id, body)
     db.commit()
@@ -154,7 +154,7 @@ def update_question(
     question_id: str,
     body: QuestionUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionOut:
     q = db.get(Question, question_id)
     if not q or q.institution_id != user.institution_id:
@@ -181,7 +181,7 @@ def update_question(
 def delete_question(
     question_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> None:
     q = db.get(Question, question_id)
     if q:
@@ -234,7 +234,7 @@ def get_question_paper(
 def create_question_paper(
     body: QuestionPaperCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionPaperOut:
     questions = (
         db.query(Question)
@@ -267,7 +267,7 @@ def create_question_paper(
 def create_question_paper_bulk(
     body: QuestionPaperBulkCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionPaperOut:
     if not body.questions:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one question is required")
@@ -324,7 +324,7 @@ def create_question_paper_bulk(
 def create_custom_paper(
     body: CustomPaperCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionPaperOut:
     parent = db.get(QuestionPaper, body.parent_paper_id)
     if not parent:
@@ -349,7 +349,7 @@ def update_question_paper(
     paper_id: str,
     body: QuestionPaperUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionPaperOut:
     paper = db.get(QuestionPaper, paper_id)
     if not paper or paper.institution_id != user.institution_id:
@@ -375,7 +375,7 @@ def update_question_paper(
 def delete_question_paper(
     paper_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor")),
+    user: User = Depends(require_roles("tutor", "admin")),
 ) -> None:
     paper = db.get(QuestionPaper, paper_id)
     if paper:

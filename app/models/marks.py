@@ -2,6 +2,7 @@ from sqlalchemy import Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.db.registry import institution_fk_target
 
 
 class MarksEntry(Base):
@@ -10,7 +11,7 @@ class MarksEntry(Base):
     __tablename__ = "marks_entries"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    institution_id: Mapped[str] = mapped_column(ForeignKey("institutions.id"))
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
     session_id: Mapped[str] = mapped_column(String(64), index=True)
     student_id: Mapped[str] = mapped_column(ForeignKey("student_profiles.id"))
     batch_id: Mapped[str | None] = mapped_column(ForeignKey("batches.id"), nullable=True)

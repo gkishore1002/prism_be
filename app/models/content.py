@@ -2,13 +2,14 @@ from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.db.registry import institution_fk_target
 
 
 class Batch(Base):
     __tablename__ = "batches"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    institution_id: Mapped[str] = mapped_column(ForeignKey("institutions.id"))
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
     name: Mapped[str] = mapped_column(String(128))
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
@@ -28,7 +29,7 @@ class QuestionPaper(Base):
     __tablename__ = "question_papers"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    institution_id: Mapped[str] = mapped_column(ForeignKey("institutions.id"))
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
     name: Mapped[str] = mapped_column(String(255))
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))

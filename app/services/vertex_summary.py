@@ -6,7 +6,8 @@ import json
 import logging
 import subprocess
 import time
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from typing import Any, Callable
 
 from app.core.config import settings
 
@@ -123,7 +124,7 @@ def _generate(prompt: str, *, cache_key: str) -> str | None:
     if cached:
         return cached
 
-    try:
+    def _call_vertex() -> str | None:
         from google.genai import types
 
         client = _get_client()
@@ -141,9 +142,48 @@ def _generate(prompt: str, *, cache_key: str) -> str | None:
             return None
         _cache_set(cache_key, text)
         return text
+
+    timeout = max(1, settings.vertex_request_timeout_seconds)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_call_vertex).result(timeout=timeout)
+    except FuturesTimeoutError:
+        logger.warning("Vertex summary timed out after %ss (cache_key=%s)", timeout, cache_key)
+        return None
     except Exception as exc:  # noqa: BLE001
         logger.warning("Vertex summary generation failed: %s", exc)
         return None
+
+
+def generate_pair_parallel(
+    en_fn: Callable[[dict[str, Any]], str | None],
+    ta_fn: Callable[[dict[str, Any]], str | None],
+    context: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Run English and Tamil Vertex generators in parallel; never raise on timeout."""
+    if not settings.vertex_enabled:
+        return None, None
+
+    timeout = max(1, settings.vertex_request_timeout_seconds) + 4
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        en_future = pool.submit(en_fn, context)
+        ta_future = pool.submit(ta_fn, context)
+        en: str | None = None
+        ta: str | None = None
+        try:
+            en = en_future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            logger.warning("Vertex English summary timed out after %ss", timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Vertex English summary failed: %s", exc)
+        try:
+            ta = ta_future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            logger.warning("Vertex Tamil summary timed out after %ss", timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Vertex Tamil summary failed: %s", exc)
+    return en, ta
 
 
 def generate_assessment_report_summary(context: dict[str, Any]) -> str | None:
@@ -155,6 +195,42 @@ Assessment result data (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 2–3 sentences covering: score on this assessment, performance vs class average if available, one strength, and one focus area from weak topics. Be specific to THIS assessment only — do not discuss overall career or unrelated subjects. Plain text only."""
+    return _generate(prompt, cache_key=key)
+
+
+def generate_assessment_report_summary_ta(context: dict[str, Any]) -> str | None:
+    """Tamil assessment summary — persisted alongside English."""
+    key = _cache_key("assessment_report_ta", context)
+    prompt = f"""You are an academic advisor writing a short report in Tamil (Tamil script only) for one completed assessment.
+
+Assessment result data (JSON):
+{json.dumps(context, indent=2, default=str)}
+
+Write 2–3 sentences in Tamil covering: score on this assessment, performance vs class average if available, one strength, and one focus area. Plain Tamil text only — no English, no markdown."""
+    return _generate(prompt, cache_key=key)
+
+
+def generate_student_report_summary_ta(context: dict[str, Any]) -> str | None:
+    """Tamil executive summary for overall performance report."""
+    key = _cache_key("student_report_ta", context)
+    prompt = f"""You are an academic advisor writing a concise executive summary in Tamil (Tamil script only) for a student's progress report.
+
+Student data (JSON):
+{json.dumps(context, indent=2, default=str)}
+
+Write 2–3 sentences in Tamil for parents and tutors. Cover overall performance, trends, and top priorities. Plain Tamil only — no English, no bullet points, no markdown."""
+    return _generate(prompt, cache_key=key)
+
+
+def generate_student_genome_narrative_ta(context: dict[str, Any]) -> str | None:
+    """Tamil Learning Genome narrative."""
+    key = _cache_key("student_genome_ta", context)
+    prompt = f"""You are an educational data analyst writing a Learning Genome narrative in Tamil (Tamil script only) for a student.
+
+Student genome metrics (JSON):
+{json.dumps(context, indent=2, default=str)}
+
+Write 3–4 short paragraphs in Tamil covering: overall standing, subject strengths and weaknesses, trend, and projected performance. Plain Tamil only — no English, no bullet points, no markdown."""
     return _generate(prompt, cache_key=key)
 
 
