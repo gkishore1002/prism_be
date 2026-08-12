@@ -18,6 +18,8 @@ env/
 .env
 .env.*
 !.env.example
+!.env.docker.example
+.env.docker
 
 # Local SQLite database
 *.db

@@ -1,0 +1,43 @@
+# Prism — backend + Postgres (frontend runs separately in prism_fe)
+#
+# Usage (from this repo root):
+#   docker compose -f docker-compose.backend.yml up -d --build
+#   cd ../prism_fe && npm run dev
+#   Open http://localhost:5174
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prism}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prism123}
+      POSTGRES_DB: ${POSTGRES_DB:-prism}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - prism_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prism} -d ${POSTGRES_DB:-prism}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+    ports:
+      - "${BACKEND_PORT:-8002}:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-prism}:${POSTGRES_PASSWORD:-prism123}@postgres:5432/${POSTGRES_DB:-prism}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174}
+      SEED_DEMO: ${SEED_DEMO:-true}
+      AUTO_BOOTSTRAP: "false"
+      CSC_SCHEDULER_ENABLED: "true"
+      DEFAULT_ORGANIZATION_CODE: ${DEFAULT_ORGANIZATION_CODE:-CSC}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  prism_postgres_data:

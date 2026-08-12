@@ -1,8 +1,27 @@
 # Prism Backend (`prism_be`)
 
-FastAPI API for [prism_fe](../prism_fe). JSON uses **camelCase** on the wire.
+FastAPI API for [prism_fe](https://github.com/gkishore1002/prism_fe). JSON uses **camelCase** on the wire.
 
-**Full stack setup (Docker + frontend):** see the [root README](../README.md).
+---
+
+## New device — quick start
+
+```powershell
+git clone https://github.com/gkishore1002/prism_be.git
+git clone https://github.com/gkishore1002/prism_fe.git
+
+cd prism_be
+docker compose -f docker-compose.backend.yml up -d --build
+
+cd ..\prism_fe
+copy .env.example .env
+npm install
+npm run dev
+```
+
+Open **http://localhost:5174** — demo login: org `DEMO001`, `admin@demo.com`, `demo1234`.
+
+More detail: [docs/DOCKER_BACKEND.md](docs/DOCKER_BACKEND.md)
 
 ---
 
@@ -11,8 +30,15 @@ FastAPI API for [prism_fe](../prism_fe). JSON uses **camelCase** on the wire.
 Postgres + API only — run the frontend separately.
 
 ```powershell
-cd c:\Current
+cd prism_be
 docker compose -f docker-compose.backend.yml up -d --build
+```
+
+Optional custom ports/secrets:
+
+```powershell
+copy .env.docker.example .env.docker
+docker compose -f docker-compose.backend.yml --env-file .env.docker up -d --build
 ```
 
 - API: http://127.0.0.1:8002  
@@ -30,7 +56,7 @@ VITE_API_BASE_URL=http://127.0.0.1:8002/api/v1
 ## Run locally (SQLite, no Docker)
 
 ```powershell
-cd c:\Current\prism_be
+cd prism_be
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -91,12 +117,12 @@ Creating users (`POST /admins`, `/tutors`, `/students`) takes a **phone** and op
 
 ```powershell
 # Docker Postgres
-cd c:\Current
+cd prism_be
 docker compose -f docker-compose.backend.yml down -v
 docker compose -f docker-compose.backend.yml up -d --build
 
 # SQLite
-Remove-Item c:\Current\prism_be\prism.db
+Remove-Item .\prism.db
 ```
 
 ---
@@ -145,12 +171,8 @@ prism_be/
 │   ├── models/
 │   ├── services/       # business logic (incl. user_credentials.py)
 │   └── schemas/
+├── docker-compose.backend.yml
+├── Dockerfile
 ├── requirements.txt
 └── .env.example
 ```
-
----
-
-## Customer deployments
-
-Use [`docker-compose.customer.yml`](../docker-compose.customer.yml) as a template: one deployment + one Postgres database per customer. Run `/setup` once per customer DB — do not share a single database across customers.
