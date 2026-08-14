@@ -15,7 +15,7 @@ from app.models.institution import Center, Institution
 from app.models.user import StudentProfile, User
 from app.services import analytics_recompute as recompute_svc
 from app.services import topic_readiness as topic_readiness_svc
-from app.services.user_roles import filter_users_with_role
+from app.services.user_roles import filter_users_with_role, is_tutor_account
 from app.utils import from_json_list
 
 
@@ -46,9 +46,52 @@ def _students_for_scope(
     center_ids: list[str] | None = None,
 ) -> list[StudentProfile]:
     students = _students_for_institution(db, institution_id)
-    if center_ids is not None:
-        students = [s for s in students if s.center_id in center_ids]
-    return students
+    if center_ids is None:
+        return students
+    allowed = set(center_ids)
+    return [s for s in students if s.center_id in allowed]
+
+
+def _scoped_student_ids(center_ids: list[str] | None, students: list[StudentProfile]) -> set[str] | None:
+    if center_ids is None:
+        return None
+    allowed = set(center_ids)
+    return {s.id for s in students if s.center_id in allowed}
+
+
+def _tutor_in_scope(db: Session, tutor: User, center_ids: list[str] | None) -> bool:
+    if center_ids is None:
+        return True
+    from app.services.branch_access import assigned_center_ids
+
+    assigned = assigned_center_ids(db, tutor.id)
+    if not assigned:
+        return is_tutor_account(tutor)
+    return bool(set(assigned) & set(center_ids))
+
+
+def _student_improvement_delta(db: Session, institution_id: str, profile: StudentProfile) -> int:
+    delta = recompute_svc.score_delta_from_events(
+        recompute_svc.student_score_events(db, institution_id, profile.id)
+    )
+    return delta if delta is not None else 0
+
+
+def _cohort_improvement(db: Session, institution_id: str, students: list[StudentProfile]) -> int:
+    if not students:
+        return 0
+    return recompute_svc.cohort_score_improvement(db, institution_id, [s.id for s in students])
+
+
+def _cohort_topic_mastery_avg(
+    db: Session, institution_id: str, students: list[StudentProfile]
+) -> int:
+    if not students:
+        return 0
+    student_ids = {s.id for s in students}
+    rows = recompute_svc.topic_mastery_rows(db, institution_id, student_ids=student_ids)
+    masteries = [r["mastery"] for r in rows if r["mastery"] > 0]
+    return round(mean(masteries)) if masteries else 0
 
 
 def get_institution_operational_stats(
@@ -108,27 +151,29 @@ def get_institution_overview(
     center_ids: list[str] | None = None,
 ) -> dict:
     students = _students_for_scope(db, institution_id, center_ids)
-    tutors = filter_users_with_role(
+    tutor_query = filter_users_with_role(
         db.query(User).filter(User.institution_id == institution_id),
         "tutor",
-    ).count()
+    )
+    tutors = [t for t in tutor_query.all() if _tutor_in_scope(db, t, center_ids)]
     boards: dict[str, int] = defaultdict(int)
     for s in students:
         board_label = (s.board or "").strip() or "Unassigned"
         boards[board_label] += 1
-    health_scores = [s.health for s in students] or [0]
-    readiness_scores = [s.readiness for s in students] or [0]
+    health_scores = [s.health for s in students if s.health > 0] or [0]
+    readiness_scores = [s.readiness for s in students if s.readiness > 0] or [0]
     improving = sum(1 for s in students if s.improving)
+    score_growth = _cohort_improvement(db, institution_id, students)
     inst_dict = _institution_dict(db, institution_id)
     inst_dict["studentCount"] = len(students)
     return {
         "institution": inst_dict,
         "totalStudents": len(students),
-        "tutorCount": tutors,
+        "tutorCount": len(tutors),
         "byBoard": [{"board": b, "count": c} for b, c in boards.items()],
-        "avgImprovement": round(mean([s.readiness - 60 for s in students]) if students else 0),
-        "parentNps": min(100, round(mean(readiness_scores) * 0.85)) if readiness_scores else 0,
-        "retention": round(88 + (improving / max(len(students), 1)) * 10),
+        "avgImprovement": score_growth,
+        "parentNps": round(mean(readiness_scores)) if readiness_scores else 0,
+        "retention": round(100 * improving / len(students)) if students else 0,
         "avgHealth": round(mean(health_scores)),
         "avgReadiness": round(mean(readiness_scores)),
     }
@@ -153,11 +198,19 @@ def _institution_dict(db: Session, institution_id: str) -> dict:
     }
 
 
-def get_centers_analytics(db: Session, institution_id: str) -> list[dict]:
+def get_centers_analytics(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
     from app.services.centers import student_counts_by_center
 
     centers = db.query(Center).filter(Center.institution_id == institution_id).all()
-    students = _students_for_institution(db, institution_id)
+    if center_ids is not None:
+        allowed = set(center_ids)
+        centers = [c for c in centers if c.id in allowed]
+    students = _students_for_scope(db, institution_id, center_ids)
     by_center: dict[str, list[StudentProfile]] = defaultdict(list)
     for s in students:
         by_center[s.center_id or "unknown"].append(s)
@@ -166,8 +219,11 @@ def get_centers_analytics(db: Session, institution_id: str) -> list[dict]:
     result = []
     for c in centers:
         cohort = by_center.get(c.id, [])
-        avg = round(mean([s.health for s in cohort])) if cohort else 70
+        scored = [s for s in cohort if s.health > 0]
+        avg = round(mean([s.health for s in scored])) if scored else 0
+        active = sum(1 for s in cohort if s.status == "active")
         student_count = live_counts.get(c.id, len(cohort))
+        readiness_avg = round(mean([s.readiness for s in scored])) if scored else 0
         result.append({
             "id": c.id,
             "name": c.name,
@@ -176,24 +232,32 @@ def get_centers_analytics(db: Session, institution_id: str) -> list[dict]:
             "studentCount": student_count,
             "batchCount": c.batch_count or 0,
             "avg": avg,
-            "retention": min(98, 80 + avg // 5),
-            "nps": min(90, 40 + avg // 2),
-            "growth": max(5, avg // 5),
+            "retention": round(100 * active / len(cohort)) if cohort else 0,
+            "nps": readiness_avg,
+            "growth": _cohort_improvement(db, institution_id, cohort),
+            "topicMastery": _cohort_topic_mastery_avg(db, institution_id, cohort),
         })
     return result
 
 
-def get_board_report(db: Session, institution_id: str) -> list[dict]:
-    students = _students_for_institution(db, institution_id)
-    subject_health = get_subject_health_distribution(db, institution_id)
+def get_board_report(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
+    students = _students_for_scope(db, institution_id, center_ids)
+    subject_health = get_subject_health_distribution(db, institution_id, center_ids=center_ids)
     ranked_subjects = sorted(subject_health, key=lambda r: r["health"], reverse=True) if subject_health else []
     boards: dict[str, list[StudentProfile]] = defaultdict(list)
     for s in students:
         boards[s.board].append(s)
     rows = []
     for board, cohort in boards.items():
-        avg = round(mean([s.health for s in cohort]))
+        scored = [s for s in cohort if s.health > 0]
+        avg = round(mean([s.health for s in scored])) if scored else 0
         at_risk = sum(1 for s in cohort if s.health < 55 or not s.improving)
+        syllabus_avg = _cohort_topic_mastery_avg(db, institution_id, cohort)
         if ranked_subjects:
             top_subject = ranked_subjects[0]["subject"]
             weak_subject = ranked_subjects[-1]["subject"]
@@ -204,21 +268,27 @@ def get_board_report(db: Session, institution_id: str) -> list[dict]:
             "board": board,
             "students": len(cohort),
             "avg": avg,
-            "improvement": round(mean([s.readiness - 55 for s in cohort])),
+            "improvement": _cohort_improvement(db, institution_id, cohort),
             "atRisk": at_risk,
-            "syllabus": min(95, avg + 8),
+            "syllabus": syllabus_avg,
             "topSubject": top_subject,
             "weakSubject": weak_subject,
         })
     return rows
 
 
-def get_teachers(db: Session, institution_id: str) -> list[dict]:
+def get_teachers(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
     tutors = filter_users_with_role(
         db.query(User).filter(User.institution_id == institution_id),
         "tutor",
     ).all()
-    students = _students_for_institution(db, institution_id)
+    tutors = [t for t in tutors if _tutor_in_scope(db, t, center_ids)]
+    students = _students_for_scope(db, institution_id, center_ids)
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     assessments = (
         db.query(Assessment)
@@ -237,9 +307,12 @@ def get_teachers(db: Session, institution_id: str) -> list[dict]:
                 if batch.name in batch_names:
                     cohort_ids.update(_batch_student_ids(db, batch.id))
         cohort = [s for s in students if s.id in cohort_ids]
+        if center_ids is not None and not cohort:
+            continue
         if not cohort and len(tutors) == 1:
             cohort = students
-        avg_health = round(mean([s.health for s in cohort])) if cohort else 75
+        scored = [s for s in cohort if s.health > 0]
+        avg_health = round(mean([s.health for s in scored])) if scored else 0
         primary_subject = tutor_assessments[0].subject if tutor_assessments else "General"
         result.append({
             "id": t.id,
@@ -248,8 +321,8 @@ def get_teachers(db: Session, institution_id: str) -> list[dict]:
             "subject": f"{primary_subject} · {cohort[0].board if cohort else 'Institution'}",
             "students": len(cohort),
             "improved": round(100 * sum(1 for s in cohort if s.improving) / len(cohort)) if cohort else 0,
-            "growth": max(5, avg_health // 5),
-            "readiness": round(mean([s.readiness for s in cohort])) if cohort else 70,
+            "growth": _cohort_improvement(db, institution_id, cohort),
+            "readiness": round(mean([s.readiness for s in scored])) if scored else 0,
         })
     return result
 
@@ -260,8 +333,16 @@ def _batch_student_ids(db: Session, batch_id: str) -> list[str]:
     return [r.student_id for r in db.query(BatchStudent).filter(BatchStudent.batch_id == batch_id).all()]
 
 
-def get_hardest_topics(db: Session, institution_id: str, limit: int = 5) -> list[dict]:
-    topics = _topic_mastery_rows(db, institution_id)
+def get_hardest_topics(
+    db: Session,
+    institution_id: str,
+    limit: int = 5,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
+    students = _students_for_scope(db, institution_id, center_ids)
+    student_ids = _scoped_student_ids(center_ids, students)
+    topics = _topic_mastery_rows(db, institution_id, student_ids=student_ids)
     weak = sorted(topics, key=lambda t: t["mastery"])[:limit]
     return [{"topic": t["topic"], "correct": t["mastery"]} for t in weak]
 
@@ -281,10 +362,21 @@ def _topic_mastery_rows(
     )
 
 
-def get_syllabus_completion(db: Session, institution_id: str) -> list[dict]:
+def get_syllabus_completion(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
+    students = _students_for_scope(db, institution_id, center_ids)
+    student_ids = _scoped_student_ids(center_ids, students)
     mastery_by_topic = {
         row["topic_id"]: row["mastery"]
-        for row in recompute_svc.topic_mastery_rows(db, institution_id)
+        for row in recompute_svc.topic_mastery_rows(
+            db,
+            institution_id,
+            student_ids=student_ids,
+        )
     }
     boards = (
         db.query(Board)
@@ -309,17 +401,50 @@ def get_syllabus_completion(db: Session, institution_id: str) -> list[dict]:
     return rows
 
 
-def get_monthly_trend(db: Session, institution_id: str) -> list[dict]:
-    return recompute_svc.institution_monthly_trend(db, institution_id)
+def get_monthly_trend(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
+    if center_ids is None:
+        return recompute_svc.institution_monthly_trend(db, institution_id)
+    students = _students_for_scope(db, institution_id, center_ids)
+    all_events: list[dict] = []
+    for profile in students:
+        all_events.extend(recompute_svc.student_score_events(db, institution_id, profile.id))
+    trend = recompute_svc.monthly_trend_from_events(all_events)
+    if trend:
+        return trend[-6:]
+    return []
 
 
-def get_subject_health_distribution(db: Session, institution_id: str) -> list[dict]:
-    rows = recompute_svc.subject_health_distribution(db, institution_id)
-    if rows:
-        return rows
-    students = _students_for_institution(db, institution_id)
-    avg = round(mean([s.health for s in students])) if students else 50
-    return [{"subject": "Overall", "health": avg}]
+def get_subject_health_distribution(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
+    if center_ids is None:
+        rows = recompute_svc.subject_health_distribution(db, institution_id)
+        if rows:
+            return rows
+        students = _students_for_institution(db, institution_id)
+        avg = round(mean([s.health for s in students if s.health > 0])) if students else 0
+        return [{"subject": "Overall", "health": avg}] if avg else []
+
+    students = _students_for_scope(db, institution_id, center_ids)
+    by_subject: dict[str, list[int]] = defaultdict(list)
+    for profile in students:
+        for subject in recompute_svc.subject_scores_for_student(db, institution_id, profile.id):
+            by_subject[subject["subjectName"]].append(subject["health"])
+    if by_subject:
+        return [
+            {"subject": subject, "health": round(mean(scores))}
+            for subject, scores in sorted(by_subject.items())
+        ]
+    avg = round(mean([s.health for s in students if s.health > 0])) if students else 0
+    return [{"subject": "Overall", "health": avg}] if avg else []
 
 
 def ensure_student_profile(db: Session, user: User) -> StudentProfile:
@@ -345,22 +470,25 @@ def ensure_student_profile(db: Session, user: User) -> StudentProfile:
         batch="Unassigned",
         center_id="",
         academic_year="2025-26",
-        health=70,
-        health_status="good",
-        readiness=65,
-        critical_gaps=1,
-        improving=True,
+        health=0,
+        health_status="weak",
+        readiness=0,
+        critical_gaps=0,
+        improving=False,
     )
     db.add(profile)
     db.commit()
     db.refresh(profile)
-    return profile
+    recomputed = recompute_svc.recompute_student_profile(db, user.id)
+    return recomputed or profile
 
 
 def get_student_profile(db: Session, student_id: str) -> dict | None:
     profile = db.get(StudentProfile, student_id)
     if not profile:
         return None
+    institution_id = profile.user.institution_id
+    events = recompute_svc.student_score_events(db, institution_id, student_id)
     return {
         "id": profile.id,
         "name": profile.user.name,
@@ -371,8 +499,8 @@ def get_student_profile(db: Session, student_id: str) -> dict | None:
         "academicYear": profile.academic_year,
         "healthScore": profile.health,
         "readiness": profile.readiness,
-        "improvement": max(0, profile.readiness - 55),
-        "streak": 5 + profile.critical_gaps,
+        "improvement": _student_improvement_delta(db, institution_id, profile),
+        "streak": len(events),
         "status": profile.health_status,
     }
 
@@ -381,11 +509,13 @@ def get_student_health(db: Session, student_id: str) -> dict:
     profile = db.get(StudentProfile, student_id)
     if not profile:
         return {"overall": 0, "status": "weak", "trend": 0, "subjects": []}
+    institution_id = profile.user.institution_id
+    delta = _student_improvement_delta(db, institution_id, profile)
     subjects = _subjects_for_student(db, profile)
     return {
         "overall": profile.health,
         "status": profile.health_status,
-        "trend": 4 if profile.improving else -2,
+        "trend": delta,
         "subjects": subjects,
     }
 
@@ -395,9 +525,6 @@ def _subjects_for_student(db: Session, profile: StudentProfile) -> list[dict]:
         db, profile.user.institution_id, profile.id
     )
     if subjects_out:
-        trend = 3 if profile.improving else -1
-        for row in subjects_out:
-            row["trend"] = trend
         return subjects_out
     return [
         {
@@ -405,7 +532,7 @@ def _subjects_for_student(db: Session, profile: StudentProfile) -> list[dict]:
             "subjectName": "Overall",
             "health": profile.health,
             "status": profile.health_status,
-            "trend": 2 if profile.improving else -1,
+            "trend": 0,
         }
     ]
 
@@ -468,7 +595,7 @@ def get_improvement_trend(db: Session, student_id: str) -> list[dict]:
     trend = recompute_svc.monthly_trend_from_events(events)
     if trend:
         return trend[-6:]
-    return [{"month": "Current", "score": profile.health}]
+    return []
 
 
 def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
@@ -573,6 +700,7 @@ def get_student_wise_report(db: Session, student_id: str) -> dict | None:
         f"{profile.user.name} is {'improving' if profile.improving else 'needs support'} "
         f"with {profile.critical_gaps} critical gaps."
     )
+    improvement = _student_improvement_delta(db, profile.user.institution_id, profile)
     report_context = {
         "studentName": profile.user.name,
         "board": profile.board,
@@ -580,7 +708,7 @@ def get_student_wise_report(db: Session, student_id: str) -> dict | None:
         "batch": profile.batch,
         "health": profile.health,
         "readiness": profile.readiness,
-        "improvement": max(0, profile.readiness - 55),
+        "improvement": improvement,
         "avgAccuracy": avg_accuracy,
         "status": profile.health_status,
         "criticalGaps": profile.critical_gaps,
@@ -595,7 +723,7 @@ def get_student_wise_report(db: Session, student_id: str) -> dict | None:
         "studentId": student_id,
         "health": profile.health,
         "readiness": profile.readiness,
-        "improvement": max(0, profile.readiness - 55),
+        "improvement": improvement,
         "avgAccuracy": avg_accuracy,
         "status": profile.health_status,
         "criticalGaps": profile.critical_gaps,
@@ -673,7 +801,7 @@ def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
         "batch": profile.batch,
         "health": profile.health,
         "readiness": profile.readiness,
-        "improvement": wise.get("improvement", max(0, profile.readiness - 55)),
+        "improvement": wise.get("improvement", _student_improvement_delta(db, profile.user.institution_id, profile)),
         "avgAccuracy": wise.get("avgAccuracy", profile.health),
         "status": profile.health_status,
         "criticalGaps": profile.critical_gaps,
@@ -712,15 +840,6 @@ def get_monthly_reports(db: Session, student_id: str) -> list[dict]:
         month_labels[key] = dt.strftime("%B %Y")
         by_month[key].append(event["pct"])
     if not by_month:
-        if profile.health:
-            return [
-                {
-                    "period": "Current",
-                    "health": profile.health,
-                    "readiness": profile.readiness,
-                    "improvement": max(0, profile.readiness - 50),
-                }
-            ]
         return []
     sorted_keys = sorted(by_month.keys())[-6:]
     reports: list[dict] = []
@@ -728,8 +847,8 @@ def get_monthly_reports(db: Session, student_id: str) -> list[dict]:
     for key in sorted_keys:
         scores = by_month[key]
         health = round(mean(scores))
-        readiness = min(100, max(35, health + min(12, len(scores) * 2)))
-        improvement = max(0, health - prev_health) if prev_health is not None else max(0, health - 50)
+        readiness = profile.readiness if prev_health is None else health
+        improvement = health - prev_health if prev_health is not None else 0
         reports.append(
             {
                 "period": month_labels[key],
@@ -807,7 +926,7 @@ def get_tutor_topic_weakness(
             "avgMastery": t["mastery"],
             "avgPredictedScore": avg_predicted,
             "suggestedNextClass": f"Level Up: {t['topic']} Mastery",
-            "expectedGain": max(4, 10 - i * 2),
+            "expectedGain": max(1, round((100 - t["mastery"]) / 10)),
         })
     return result
 
@@ -818,8 +937,9 @@ def get_tutor_at_risk(
     *,
     batch_id: str | None = None,
     batch_name: str | None = None,
+    center_ids: list[str] | None = None,
 ) -> list[dict]:
-    students = _students_for_institution(db, institution_id)
+    students = _students_for_scope(db, institution_id, center_ids)
     student_ids = _student_ids_for_batch(
         db, institution_id, batch_id=batch_id, batch_name=batch_name
     )
@@ -852,8 +972,13 @@ def get_tutor_batch_heatmap(
     return [{"topic": t["topic"], "mastery": t["mastery"]} for t in topics]
 
 
-def get_class_insights(db: Session, institution_id: str) -> list[dict]:
-    students = _students_for_institution(db, institution_id)
+def get_class_insights(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
+    students = _students_for_scope(db, institution_id, center_ids)
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     result = []
     for b in batches:
@@ -1072,10 +1197,15 @@ def get_admin_dashboard(db: Session, institution_id: str) -> dict:
     }
 
 
-def get_student_master_profiles(db: Session, institution_id: str) -> list[dict]:
+def get_student_master_profiles(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+) -> list[dict]:
     from app.services.csc_eligibility import days_until_csc_disable
 
-    students = _students_for_institution(db, institution_id)
+    students = _students_for_scope(db, institution_id, center_ids)
     result = []
     for s in students:
         batch_ids = [

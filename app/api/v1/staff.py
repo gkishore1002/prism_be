@@ -83,7 +83,11 @@ def _assert_create_permissions(body: StaffCreate, actor: User, role: str) -> Non
 def list_staff(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> list[StaffOut]:
+    from app.services.branch_access import get_accessible_center_ids, is_organization_owner
+
+    role = get_effective_role(payload, user)
     rows = (
         db.query(User)
         .filter(
@@ -93,7 +97,24 @@ def list_staff(
         .order_by(User.name)
         .all()
     )
-    return [_staff_out(db, row) for row in rows]
+    accessible = get_accessible_center_ids(db, user, role)
+    if accessible is None:
+        return [_staff_out(db, row) for row in rows]
+    if not accessible:
+        return []
+    allowed = set(accessible)
+    filtered: list[User] = []
+    for row in rows:
+        if is_organization_owner(row, "admin"):
+            continue
+        staff_centers = assigned_center_ids(db, row.id)
+        if not staff_centers:
+            if is_tutor_account(row):
+                filtered.append(row)
+            continue
+        if allowed.intersection(staff_centers):
+            filtered.append(row)
+    return [_staff_out(db, row) for row in filtered]
 
 
 @router.post("", response_model=StaffOut, status_code=status.HTTP_201_CREATED)

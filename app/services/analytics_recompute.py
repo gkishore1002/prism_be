@@ -204,6 +204,7 @@ def subject_scores_for_student(db: Session, institution_id: str, student_id: str
             by_subject[row["subject"]].append(row["mastery"])
 
     subjects_out = []
+    all_events = student_score_events(db, institution_id, student_id)
     for subject, scores in sorted(by_subject.items()):
         score = round(mean(scores))
         subjects_out.append(
@@ -212,7 +213,7 @@ def subject_scores_for_student(db: Session, institution_id: str, student_id: str
                 "subjectName": subject,
                 "health": score,
                 "status": _health_status(score),
-                "trend": 0,
+                "trend": subject_trend_from_events(all_events, subject),
             }
         )
     return subjects_out
@@ -274,11 +275,11 @@ def recompute_student_profile(db: Session, student_id: str) -> StudentProfile | 
         if profile.critical_gaps == 0 and profile.health < 55:
             profile.critical_gaps = 1
     else:
-        profile.health = 50
-        profile.health_status = "fair"
-        profile.readiness = 50
+        profile.health = 0
+        profile.health_status = "weak"
+        profile.readiness = 0
         profile.critical_gaps = 0
-        profile.improving = True
+        profile.improving = False
 
     db.add(profile)
     return profile
@@ -327,6 +328,37 @@ def monthly_trend_from_events(events: list[dict]) -> list[dict]:
     return [{"month": month, "score": round(mean(scores))} for month, scores in ordered]
 
 
+def score_delta_from_events(events: list[dict]) -> int | None:
+    """Change in average score (percentage points) between recent and prior assessments."""
+    if len(events) < 2:
+        return None
+    scores = [int(e["pct"]) for e in events]
+    recent = scores[-3:] if len(scores) >= 3 else scores[-1:]
+    prior = scores[-6:-3] if len(scores) >= 6 else scores[: max(0, len(scores) - len(recent))]
+    if not prior:
+        return None
+    return round(mean(recent) - mean(prior))
+
+
+def cohort_score_improvement(
+    db: Session, institution_id: str, student_ids: list[str]
+) -> int:
+    """Average score growth across students who have at least two score events."""
+    deltas: list[int] = []
+    for sid in student_ids:
+        delta = score_delta_from_events(student_score_events(db, institution_id, sid))
+        if delta is not None:
+            deltas.append(delta)
+    return round(mean(deltas)) if deltas else 0
+
+
+def subject_trend_from_events(events: list[dict], subject: str) -> int:
+    """Score delta for one subject from mark/assessment events."""
+    subject_events = [e for e in events if e.get("subject") == subject]
+    delta = score_delta_from_events(subject_events)
+    return delta if delta is not None else 0
+
+
 def institution_monthly_trend(db: Session, institution_id: str) -> list[dict]:
     all_events: list[dict] = []
     profiles = (
@@ -340,10 +372,7 @@ def institution_monthly_trend(db: Session, institution_id: str) -> list[dict]:
     trend = monthly_trend_from_events(all_events)
     if trend:
         return trend[-6:]
-    students = profiles
-    base = round(mean([s.health for s in students])) if students else 50
-    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
-    return [{"month": m, "score": base} for m in months]
+    return []
 
 
 def subject_health_distribution(db: Session, institution_id: str) -> list[dict]:

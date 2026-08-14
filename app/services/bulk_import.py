@@ -111,17 +111,92 @@ def _resolve_center_ids(
     return list(dict.fromkeys(resolved))
 
 
-def _assign_student_batch(db: Session, institution_id: str, student_id: str, batch_name: str) -> None:
+def _unique_batch_id(db: Session, name: str) -> str:
+    base_id = f"batch-{name.lower().replace(' ', '-')}"
+    batch_id = base_id
+    suffix = 1
+    while db.get(Batch, batch_id):
+        batch_id = f"{base_id}-{suffix}"
+        suffix += 1
+    return batch_id
+
+
+def _sync_profile_batch(db: Session, student_id: str) -> None:
+    profile = db.get(StudentProfile, student_id)
+    if not profile:
+        return
+    memberships = db.query(BatchStudent).filter(BatchStudent.student_id == student_id).all()
+    if not memberships:
+        profile.batch = ""
+        return
+    batch_names: list[str] = []
+    primary_batch: Batch | None = None
+    for membership in memberships:
+        batch = db.get(Batch, membership.batch_id)
+        if batch:
+            batch_names.append(batch.name)
+            if primary_batch is None:
+                primary_batch = batch
+    profile.batch = ", ".join(sorted(set(batch_names)))
+    if primary_batch:
+        profile.board = primary_batch.board
+        profile.grade = primary_batch.grade
+
+
+def _get_or_create_batch(
+    db: Session,
+    institution_id: str,
+    batch_name: str,
+    *,
+    board: str,
+    grade: str,
+) -> Batch:
+    batch_name = batch_name.strip()
+    board = board.strip()
+    grade = grade.strip()
+    batch_row = (
+        db.query(Batch)
+        .filter(
+            Batch.institution_id == institution_id,
+            Batch.board == board,
+            Batch.grade == grade,
+            Batch.name == batch_name,
+        )
+        .first()
+    )
+    if batch_row:
+        return batch_row
+    batch_row = Batch(
+        id=_unique_batch_id(db, batch_name),
+        institution_id=institution_id,
+        name=batch_name,
+        board=board,
+        grade=grade,
+    )
+    db.add(batch_row)
+    db.flush()
+    return batch_row
+
+
+def _assign_student_batch(
+    db: Session,
+    institution_id: str,
+    student_id: str,
+    batch_name: str,
+    *,
+    board: str,
+    grade: str,
+) -> None:
     batch_name = batch_name.strip()
     if not batch_name:
         return
-    batch_row = (
-        db.query(Batch)
-        .filter(Batch.institution_id == institution_id, Batch.name == batch_name)
-        .first()
+    batch_row = _get_or_create_batch(
+        db,
+        institution_id,
+        batch_name,
+        board=board,
+        grade=grade,
     )
-    if not batch_row:
-        return
     existing = (
         db.query(BatchStudent)
         .filter(BatchStudent.batch_id == batch_row.id, BatchStudent.student_id == student_id)
@@ -129,6 +204,7 @@ def _assign_student_batch(db: Session, institution_id: str, student_id: str, bat
     )
     if not existing:
         db.add(BatchStudent(batch_id=batch_row.id, student_id=student_id))
+    _sync_profile_batch(db, student_id)
 
 
 def _create_student_row(
@@ -182,7 +258,14 @@ def _create_student_row(
     )
     db.add_all([new_user, profile])
     db.flush()
-    _assign_student_batch(db, institution_id, sid, row.batch)
+    _assign_student_batch(
+        db,
+        institution_id,
+        sid,
+        row.batch,
+        board=row.board,
+        grade=row.grade,
+    )
     return sid
 
 

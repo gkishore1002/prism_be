@@ -9,6 +9,18 @@ from app.services import analytics as svc
 router = APIRouter(prefix="/analytics", tags=["analytics"], route_class=CamelCaseAPIRoute)
 
 
+def _resolve_scope(
+    db: Session,
+    user: User,
+    payload: dict,
+    center_id: str | None,
+) -> list[str] | None:
+    from app.services.branch_access import resolve_branch_filter
+
+    role = get_effective_role(payload, user)
+    return resolve_branch_filter(db, user, role, center_id)
+
+
 def _resolve_student(db: Session, user: User, student_id: str | None, payload: dict) -> str:
     if student_id:
         profile = db.get(StudentProfile, student_id)
@@ -42,10 +54,7 @@ def institution_overview(
     user: User = Depends(get_current_user),
     payload: dict = Depends(get_token_payload),
 ) -> dict:
-    from app.services.branch_access import resolve_branch_filter
-
-    role = get_effective_role(payload, user)
-    scope = resolve_branch_filter(db, user, role, center_id)
+    scope = _resolve_scope(db, user, payload, center_id)
     return svc.get_institution_overview(db, user.institution_id, center_ids=scope)
 
 
@@ -56,51 +65,96 @@ def institution_operational_stats(
     user: User = Depends(require_roles("admin", "tutor")),
     payload: dict = Depends(get_token_payload),
 ) -> dict:
-    from app.services.branch_access import resolve_branch_filter
-
-    role = get_effective_role(payload, user)
-    scope = resolve_branch_filter(db, user, role, center_id)
+    scope = _resolve_scope(db, user, payload, center_id)
     return svc.get_institution_operational_stats(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/centers")
-def institution_centers(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_centers_analytics(db, user.institution_id)
+def institution_centers(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_centers_analytics(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/boards")
-def institution_boards(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_board_report(db, user.institution_id)
+def institution_boards(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_board_report(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/teachers")
-def institution_teachers(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_teachers(db, user.institution_id)
+def institution_teachers(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_teachers(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/hardest-topics")
-def institution_hardest_topics(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_hardest_topics(db, user.institution_id)
+def institution_hardest_topics(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_hardest_topics(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/syllabus")
-def institution_syllabus(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_syllabus_completion(db, user.institution_id)
+def institution_syllabus(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_syllabus_completion(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/monthly-trend")
-def institution_monthly_trend(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_monthly_trend(db, user.institution_id)
+def institution_monthly_trend(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_monthly_trend(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/institution/subject-health")
-def institution_subject_health(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list:
-    return svc.get_subject_health_distribution(db, user.institution_id)
+def institution_subject_health(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_subject_health_distribution(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/students/master")
-def student_master_profiles(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "tutor"))) -> list:
-    return svc.get_student_master_profiles(db, user.institution_id)
+def student_master_profiles(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "tutor")),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_student_master_profiles(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/users/tutor-names")
@@ -245,11 +299,14 @@ def tutor_topic_weakness(
 def tutor_at_risk(
     batch_name: str | None = Query(None),
     batch_id: str | None = Query(None),
+    center_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
     return svc.get_tutor_at_risk(
-        db, user.institution_id, batch_id=batch_id, batch_name=batch_name
+        db, user.institution_id, batch_id=batch_id, batch_name=batch_name, center_ids=scope
     )
 
 
@@ -291,8 +348,14 @@ def student_genome(
 
 
 @router.get("/tutor/class-insights")
-def tutor_class_insights(db: Session = Depends(get_db), user: User = Depends(require_roles("tutor", "admin"))) -> list:
-    return svc.get_class_insights(db, user.institution_id)
+def tutor_class_insights(
+    center_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
+) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
+    return svc.get_class_insights(db, user.institution_id, center_ids=scope)
 
 
 @router.get("/tutor/copilot")
