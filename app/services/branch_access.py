@@ -139,6 +139,35 @@ def assert_can_access_center(db: Session, user: User, role: str, center_id: str)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Branch access denied")
 
 
+def assessment_matches_branch_scope(center_ids_raw: str | None, scope: list[str] | None) -> bool:
+    """True when an assessment belongs in the resolved branch filter."""
+    if scope is None:
+        return True
+    if not scope:
+        return False
+    import json
+
+    try:
+        assigned = json.loads(center_ids_raw or "[]")
+    except json.JSONDecodeError:
+        assigned = []
+    if not isinstance(assigned, list) or not assigned:
+        return True
+    return bool(set(assigned) & set(scope))
+
+
+def user_matches_center_scope(db: Session, staff: User, scope: list[str] | None) -> bool:
+    """True when a staff member is linked to the resolved branch filter."""
+    if scope is None:
+        return True
+    if not scope:
+        return False
+    assigned = assigned_center_ids(db, staff.id)
+    if not assigned:
+        return True
+    return bool(set(assigned) & set(scope))
+
+
 def resolve_branch_filter(
     db: Session,
     user: User,

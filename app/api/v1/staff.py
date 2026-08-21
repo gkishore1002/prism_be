@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -81,11 +81,17 @@ def _assert_create_permissions(body: StaffCreate, actor: User, role: str) -> Non
 
 @router.get("", response_model=list[StaffOut])
 def list_staff(
+    center_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
     payload: dict = Depends(get_token_payload),
 ) -> list[StaffOut]:
-    from app.services.branch_access import get_accessible_center_ids, is_organization_owner
+    from app.services.branch_access import (
+        get_accessible_center_ids,
+        is_organization_owner,
+        resolve_branch_filter,
+        user_matches_center_scope,
+    )
 
     role = get_effective_role(payload, user)
     rows = (
@@ -98,23 +104,24 @@ def list_staff(
         .all()
     )
     accessible = get_accessible_center_ids(db, user, role)
-    if accessible is None:
-        return [_staff_out(db, row) for row in rows]
-    if not accessible:
-        return []
-    allowed = set(accessible)
-    filtered: list[User] = []
-    for row in rows:
-        if is_organization_owner(row, "admin"):
-            continue
-        staff_centers = assigned_center_ids(db, row.id)
-        if not staff_centers:
-            if is_tutor_account(row):
+    if accessible is not None:
+        if not accessible:
+            return []
+        allowed = set(accessible)
+        filtered: list[User] = []
+        for row in rows:
+            if is_organization_owner(row, "admin"):
+                continue
+            staff_centers = assigned_center_ids(db, row.id)
+            if not staff_centers:
+                if is_tutor_account(row):
+                    filtered.append(row)
+                continue
+            if allowed.intersection(staff_centers):
                 filtered.append(row)
-            continue
-        if allowed.intersection(staff_centers):
-            filtered.append(row)
-    return [_staff_out(db, row) for row in filtered]
+        rows = filtered
+    scope = resolve_branch_filter(db, user, role, center_id)
+    return [_staff_out(db, row) for row in rows if user_matches_center_scope(db, row, scope)]
 
 
 @router.post("", response_model=StaffOut, status_code=status.HTTP_201_CREATED)

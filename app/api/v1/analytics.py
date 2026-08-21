@@ -287,11 +287,14 @@ def student_alerts(sid: str = Depends(resolve_student_id), db: Session = Depends
 def tutor_topic_weakness(
     batch_name: str | None = Query(None),
     batch_id: str | None = Query(None),
+    center_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
     return svc.get_tutor_topic_weakness(
-        db, user.institution_id, batch_name, batch_id=batch_id
+        db, user.institution_id, batch_name, batch_id=batch_id, center_ids=scope
     )
 
 
@@ -314,11 +317,14 @@ def tutor_at_risk(
 def tutor_batch_heatmap(
     batch_name: str | None = Query(None),
     batch_id: str | None = Query(None),
+    center_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> list:
+    scope = _resolve_scope(db, user, payload, center_id)
     return svc.get_tutor_batch_heatmap(
-        db, user.institution_id, batch_id=batch_id, batch_name=batch_name
+        db, user.institution_id, batch_id=batch_id, batch_name=batch_name, center_ids=scope
     )
 
 
@@ -362,11 +368,14 @@ def tutor_class_insights(
 def tutor_copilot(
     batch_name: str | None = Query(None),
     batch_id: str | None = Query(None),
+    center_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> dict:
+    scope = _resolve_scope(db, user, payload, center_id)
     return svc.get_tutor_copilot_summary(
-        db, user.institution_id, batch_name, batch_id=batch_id
+        db, user.institution_id, batch_name, batch_id=batch_id, center_ids=scope
     )
 
 

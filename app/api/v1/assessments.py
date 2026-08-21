@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.questions import _question_out
 from app.core.deps import get_current_user, get_db, get_effective_role, get_token_payload, require_roles
-from app.core.pagination import PaginatedOut, paginate_query
+from app.core.pagination import PaginatedOut
 from app.core.routing import CamelCaseAPIRoute
 from app.models.academic import Question
 from app.models.assessment import Assessment, AssessmentSubmission
@@ -99,35 +99,40 @@ def _assessment_out(
 def list_assessments(
     status_filter: str | None = Query(None, alias="status"),
     tutor_id: str | None = Query(None),
+    center_id: str | None = Query(None),
     page: int | None = Query(None, ge=1),
     limit: int | None = Query(None, ge=1, le=200),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
 ) -> PaginatedOut[AssessmentOut] | list[AssessmentOut]:
+    from app.services.branch_access import assessment_matches_branch_scope, resolve_branch_filter
+
+    role = get_effective_role(payload, user)
+    scope = resolve_branch_filter(db, user, role, center_id)
     q = db.query(Assessment).filter(Assessment.institution_id == user.institution_id)
     if status_filter:
         q = q.filter(Assessment.status == status_filter)
     if tutor_id:
         q = q.filter(Assessment.created_by_tutor_id == tutor_id)
     q = q.order_by(Assessment.scheduled_at.desc())
-    if page is None and limit is None:
-        rows = q.all()
-        updated = False
-        for a in rows:
-            if a.class_avg is None:
-                update_assessment_class_avg(db, a.id)
-                updated = True
-        if updated:
-            db.commit()
-        return [_assessment_out(a) for a in rows]
-    items, total, page_n, limit_n, pages = paginate_query(q, page or 1, limit)
+    rows = q.all()
+    rows = [a for a in rows if assessment_matches_branch_scope(a.center_ids, scope)]
     updated = False
-    for a in items:
+    for a in rows:
         if a.class_avg is None:
             update_assessment_class_avg(db, a.id)
             updated = True
     if updated:
         db.commit()
+    if page is None and limit is None:
+        return [_assessment_out(a) for a in rows]
+    total = len(rows)
+    page_n = page or 1
+    limit_n = limit or 20
+    pages = max(1, (total + limit_n - 1) // limit_n) if total else 1
+    start = (page_n - 1) * limit_n
+    items = rows[start : start + limit_n]
     return PaginatedOut(
         items=[_assessment_out(a) for a in items],
         total=total,

@@ -900,10 +900,14 @@ def get_tutor_topic_weakness(
     batch_name: str | None = None,
     *,
     batch_id: str | None = None,
+    center_ids: list[str] | None = None,
 ) -> list[dict]:
     student_ids = _student_ids_for_batch(
         db, institution_id, batch_id=batch_id, batch_name=batch_name
     )
+    scoped = _scoped_student_ids(center_ids, _students_for_institution(db, institution_id))
+    if scoped is not None:
+        student_ids = scoped if student_ids is None else student_ids & scoped
     topics = _topic_mastery_rows(db, institution_id, student_ids=student_ids)
     with_data = [t for t in topics if t["mastery"] > 0]
     weak = sorted(with_data or topics, key=lambda t: t["mastery"])[:5]
@@ -964,10 +968,14 @@ def get_tutor_batch_heatmap(
     *,
     batch_id: str | None = None,
     batch_name: str | None = None,
+    center_ids: list[str] | None = None,
 ) -> list[dict]:
     student_ids = _student_ids_for_batch(
         db, institution_id, batch_id=batch_id, batch_name=batch_name
     )
+    scoped = _scoped_student_ids(center_ids, _students_for_institution(db, institution_id))
+    if scoped is not None:
+        student_ids = scoped if student_ids is None else student_ids & scoped
     topics = _topic_mastery_rows(db, institution_id, student_ids=student_ids)
     return [{"topic": t["topic"], "mastery": t["mastery"]} for t in topics]
 
@@ -986,7 +994,9 @@ def get_class_insights(
         cohort = [s for s in students if s.id in ids]
         if not cohort:
             continue
-        weakness = get_tutor_topic_weakness(db, institution_id, batch_id=b.id)
+        weakness = get_tutor_topic_weakness(
+            db, institution_id, batch_id=b.id, center_ids=center_ids
+        )
         avg_health = round(mean([s.health for s in cohort]))
         weak_topic = weakness[0]["topic"] if weakness else "core topics"
         affected = len([s for s in cohort if s.health < 60 or s.critical_gaps >= 2])
@@ -1019,6 +1029,7 @@ def get_tutor_copilot_summary(
     batch_name: str | None = None,
     *,
     batch_id: str | None = None,
+    center_ids: list[str] | None = None,
 ) -> dict:
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     batch = None
@@ -1028,20 +1039,24 @@ def get_tutor_copilot_summary(
         batch = next((b for b in batches if b.name == batch_name), None)
     if batch is None and batches:
         batch = batches[0]
-    students = _students_for_institution(db, institution_id)
+    students = _students_for_scope(db, institution_id, center_ids)
     if batch:
         ids = set(_batch_student_ids(db, batch.id))
         cohort = [s for s in students if s.id in ids]
     else:
         cohort = students
     weakness = get_tutor_topic_weakness(
-        db, institution_id, batch_name=batch.name if batch else None, batch_id=batch.id if batch else None
+        db,
+        institution_id,
+        batch_name=batch.name if batch else None,
+        batch_id=batch.id if batch else None,
+        center_ids=center_ids,
     )
     top = weakness[0] if weakness else None
     topic_rows = _topic_mastery_rows(
         db,
         institution_id,
-        student_ids=set(_batch_student_ids(db, batch.id)) if batch else None,
+        student_ids={s.id for s in cohort} if cohort else set(),
     )
     strong_topics = [
         t["topic"]

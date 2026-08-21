@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 import uuid
 
@@ -213,9 +213,14 @@ def _get_tutor(db: Session, tutor_id: str, institution_id: str) -> User:
 
 @router.get("/tutors", response_model=list[TutorOut])
 def list_tutors(
+    center_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
+    payload: dict = Depends(get_token_payload),
 ) -> list[TutorOut]:
+    from app.services.branch_access import resolve_branch_filter, user_matches_center_scope
+
+    role = get_effective_role(payload, user)
     tutors = (
         filter_users_with_role(
             db.query(User).filter(User.institution_id == user.institution_id),
@@ -224,7 +229,8 @@ def list_tutors(
         .order_by(User.name)
         .all()
     )
-    return [_tutor_out(t) for t in tutors]
+    scope = resolve_branch_filter(db, user, role, center_id)
+    return [_tutor_out(t) for t in tutors if user_matches_center_scope(db, t, scope)]
 
 
 @router.post("/tutors", response_model=TutorOut, status_code=status.HTTP_201_CREATED)

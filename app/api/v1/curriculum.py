@@ -975,20 +975,24 @@ def get_batch(
 @router.get("/batches/{batch_id}/students", response_model=list[StudentSummaryOut])
 def list_batch_students(
     batch_id: str,
+    center: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    payload: dict = Depends(get_token_payload),
 ) -> list[StudentSummaryOut]:
+    role = get_effective_role(payload, user)
     batch = _get_batch(db, batch_id, user.institution_id)
     rows = db.query(BatchStudent).filter(BatchStudent.batch_id == batch.id).all()
     if not rows:
         return []
     student_ids = [row.student_id for row in rows]
-    profiles = (
+    q = (
         db.query(StudentProfile)
         .join(User)
         .filter(StudentProfile.id.in_(student_ids), User.institution_id == user.institution_id)
-        .all()
     )
+    q = apply_branch_scope_to_students(q, db, user, role, center)
+    profiles = q.all()
     by_id = {p.id: p for p in profiles}
     ordered = [by_id[sid] for sid in student_ids if sid in by_id]
     return _student_summaries(db, ordered)
