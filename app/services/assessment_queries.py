@@ -29,16 +29,21 @@ def list_assessments_for_student(
     *,
     board: str | None = None,
     grade: str | None = None,
-) -> list[tuple[Assessment, bool]]:
-    """Return (assessment, student_submitted) for a student's visible assessments."""
-    submitted_ids = {
-        s.assessment_id
-        for s in db.query(AssessmentSubmission)
+) -> list[tuple[Assessment, bool, bool]]:
+    """Return (assessment, student_submitted, attempt_in_progress)."""
+    attempts = (
+        db.query(AssessmentSubmission)
         .filter(AssessmentSubmission.student_id == student_id)
         .all()
+    )
+    submitted_ids = {
+        s.assessment_id for s in attempts if s.status in ("attended", "absent")
+    }
+    in_progress_ids = {
+        s.assessment_id for s in attempts if s.status == "in_progress"
     }
 
-    results: list[tuple[Assessment, bool]] = []
+    results: list[tuple[Assessment, bool, bool]] = []
     query = (
         db.query(Assessment)
         .filter(Assessment.institution_id == institution_id)
@@ -53,5 +58,11 @@ def list_assessments_for_student(
             continue
         if grade and not _grades_match(assessment.grade, grade):
             continue
-        results.append((assessment, assessment.id in submitted_ids))
+        results.append(
+            (
+                assessment,
+                assessment.id in submitted_ids,
+                assessment.id in in_progress_ids,
+            )
+        )
     return results

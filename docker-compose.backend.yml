@@ -79,6 +79,25 @@ services:
 
       DEFAULT_ORGANIZATION_CODE: ${DEFAULT_ORGANIZATION_CODE:-CSC}
 
+      VERTEX_ENABLED: ${VERTEX_ENABLED:-true}
+      GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-true}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
+      VERTEX_MODEL: ${VERTEX_MODEL:-gemini-2.5-flash}
+      VERTEX_SUMMARY_CACHE_TTL: ${VERTEX_SUMMARY_CACHE_TTL:-300}
+      VERTEX_BOOK_TIMEOUT_SECONDS: ${VERTEX_BOOK_TIMEOUT_SECONDS:-180}
+      VERTEX_TOPIC_MAP_TIMEOUT_SECONDS: ${VERTEX_TOPIC_MAP_TIMEOUT_SECONDS:-90}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/adc.json
+
+    volumes:
+      # Long syntax required on Windows so "C:" is not treated as a volume separator.
+      - type: bind
+        source: ${HOST_GCP_CREDENTIALS:-${APPDATA}/gcloud/application_default_credentials.json}
+        target: /gcp/adc.json
+        read_only: true
+
     depends_on:
       postgres:
         condition: service_healthy

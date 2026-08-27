@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime
+from statistics import mean
 
 from sqlalchemy.orm import Session
 
@@ -111,6 +112,53 @@ def _ensure_tamil_fields(db: Session, report: AssessmentStudentReport) -> None:
         db.refresh(report)
 
 
+def _exam_knowledge_summary(topics: list[dict], student_name: str, exam_title: str) -> str:
+    if not topics:
+        return (
+            f"Topic-level scores for {exam_title} will appear once questions on this paper are tagged."
+        )
+    avg = round(mean(int(t["masteryPct"]) for t in topics))
+    weak = sorted(topics, key=lambda t: int(t["masteryPct"]))[:3]
+    strong = sorted(topics, key=lambda t: -int(t["masteryPct"]))[:3]
+    who = student_name or "This student"
+    parts = [
+        f"On {exam_title}, {who}'s topic mastery averages {avg}% across {len(topics)} tagged topic"
+        f"{'' if len(topics) == 1 else 's'}."
+    ]
+    if strong:
+        names = ", ".join(f"{t['concept']} ({t['masteryPct']}%)" for t in strong)
+        parts.append(f"Strongest on this paper: {names}.")
+    if weak and (len(topics) > 1 or int(weak[0]["masteryPct"]) < 75):
+        names = ", ".join(f"{t['concept']} ({t['masteryPct']}%)" for t in weak)
+        parts.append(f"Needs attention on this paper: {names}.")
+    return " ".join(parts)
+
+
+def _attach_exam_knowledge(db: Session, payload: dict) -> dict:
+    profile = db.get(StudentProfile, payload.get("studentId", ""))
+    student_name = profile.user.name if profile else ""
+    payload["studentName"] = student_name
+    submission = None
+    if payload.get("submissionId"):
+        submission = db.get(AssessmentSubmission, payload["submissionId"])
+    if submission is None and payload.get("assessmentId") and payload.get("studentId"):
+        submission = (
+            db.query(AssessmentSubmission)
+            .filter(
+                AssessmentSubmission.assessment_id == payload["assessmentId"],
+                AssessmentSubmission.student_id == payload["studentId"],
+                AssessmentSubmission.status == "attended",
+            )
+            .first()
+        )
+    topics = recompute_svc.submission_topic_breakdown(db, submission)
+    payload["topicScores"] = topics
+    payload["knowledgeSummary"] = _exam_knowledge_summary(
+        topics, student_name, payload.get("assessmentTitle") or "this exam"
+    )
+    return payload
+
+
 def _report_to_dict(report: AssessmentStudentReport) -> dict:
     return {
         "id": report.id,
@@ -138,6 +186,10 @@ def _report_to_dict(report: AssessmentStudentReport) -> dict:
         "computedAt": report.computed_at,
         "reportType": "assessment",
     }
+
+
+def _report_dict(db: Session, report: AssessmentStudentReport) -> dict:
+    return _attach_exam_knowledge(db, _report_to_dict(report))
 
 
 def _report_to_student_summary(report: AssessmentStudentReport) -> dict:
@@ -191,7 +243,7 @@ def build_and_store_assessment_report(
     )
     if existing:
         _ensure_tamil_fields(db, existing)
-        return _report_to_dict(existing)
+        return _report_dict(db, existing)
 
     accuracy = round((submission.score / submission.max_score) * 100) if submission.max_score else 0
     strong_topics, weak_topics = recompute_svc.submission_topic_tags(
@@ -275,7 +327,7 @@ def build_and_store_assessment_report(
     if commit:
         db.commit()
         db.refresh(report)
-    return _report_to_dict(report)
+    return _report_dict(db, report)
 
 
 def get_assessment_report(db: Session, assessment_id: str, student_id: str) -> dict | None:
@@ -289,7 +341,7 @@ def get_assessment_report(db: Session, assessment_id: str, student_id: str) -> d
     )
     if report:
         _ensure_tamil_fields(db, report)
-        return _report_to_dict(report)
+        return _report_dict(db, report)
     return build_and_store_assessment_report(db, assessment_id, student_id)
 
 
@@ -350,7 +402,7 @@ def list_assessment_reports(db: Session, student_id: str) -> list[dict]:
         report = stored_by_assessment.get(sub.assessment_id)
         if report:
             _ensure_tamil_fields(db, report)
-            results.append(_report_to_dict(report))
+            results.append(_report_dict(db, report))
             continue
         built = build_and_store_assessment_report(db, sub.assessment_id, student_id)
         if built:

@@ -608,6 +608,7 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
                 "topic": t["topic"],
                 "topicId": t["topicId"],
                 "subject": t["subject"],
+                "chapter": t.get("chapter") or t.get("chapterName") or "",
                 "mastery": t["currentMastery"],
                 "currentMastery": t["currentMastery"],
                 "predictedScore": t["predictedScore"],
@@ -617,7 +618,7 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
                 "drivers": t["drivers"],
                 "status": t["status"],
             }
-            for t in ranked[:8]
+            for t in ranked[:24]
         ]
 
     profile = db.get(StudentProfile, student_id)
@@ -630,6 +631,7 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
             "topic": t["topic"],
             "topicId": t.get("topic_id"),
             "subject": t["subject"],
+            "chapter": t.get("chapter") or "",
             "mastery": t["mastery"],
             "currentMastery": t["mastery"],
             "predictedScore": t["mastery"],
@@ -639,11 +641,7 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
             "drivers": ["no attempts yet"],
             "status": _health_status(t["mastery"]),
         }
-        for t in ranked[:8]
-    ]
-
-
-def get_student_subjects(db: Session, student_id: str) -> list[dict]:
+        for t in ranked[:24]
     health = get_student_health(db, student_id)
     return [
         {"name": s["subjectName"], "health": s["health"], "status": s["status"]}
@@ -654,7 +652,10 @@ def get_student_subjects(db: Session, student_id: str) -> list[dict]:
 def get_recent_assessments(db: Session, student_id: str) -> list[dict]:
     subs = (
         db.query(AssessmentSubmission)
-        .filter(AssessmentSubmission.student_id == student_id)
+        .filter(
+            AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status.in_(("attended", "absent")),
+        )
         .order_by(AssessmentSubmission.submitted_at.desc())
         .limit(5)
         .all()

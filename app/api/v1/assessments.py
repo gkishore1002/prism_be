@@ -23,6 +23,7 @@ from app.services.assessment_access import (
 )
 from app.services.assessment_queries import list_assessments_for_student
 from app.services.submissions import (
+    existing_attempt,
     existing_submission,
     update_assessment_class_avg,
     update_student_profile_after_submission,
@@ -36,6 +37,8 @@ from app.schemas import (
     AssessmentAccessRequestCreate,
     AssessmentAccessRequestOut,
     AssessmentAccessRequestReview,
+    AssessmentAttemptOut,
+    AssessmentAttemptSave,
     AssessmentCreate,
     AssessmentOut,
     AssessmentSubmissionCreate,
@@ -49,10 +52,57 @@ from app.utils import dict_get, from_json_list, to_json_list
 router = APIRouter(tags=["assessments"], route_class=CamelCaseAPIRoute)
 
 
+def _shuffle_questions_flag(assessment: Assessment) -> bool:
+    return bool(getattr(assessment, "shuffle_questions", False))
+
+
+def _student_profile_or_400(db: Session, user: User) -> StudentProfile:
+    profile = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Student profile not found")
+    return profile
+
+
+def _assert_student_assigned(assessment: Assessment, profile: StudentProfile) -> None:
+    assigned = from_json_list(assessment.assigned_student_ids)
+    if profile.id not in assigned:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not assigned to this assessment")
+    if profile.status == "inactive":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your account is inactive.")
+
+
+def _attempt_out(sub: AssessmentSubmission | None) -> AssessmentAttemptOut:
+    if not sub:
+        return AssessmentAttemptOut()
+    raw = from_json_list(sub.answers)
+    answers = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        qid = dict_get(item, "question_id", "questionId")
+        if not qid:
+            continue
+        answers.append(
+            {
+                "question_id": str(qid),
+                "selected_option": str(dict_get(item, "selected_option", "selectedOption", default="") or ""),
+            }
+        )
+    remaining = getattr(sub, "remaining_seconds", None)
+    return AssessmentAttemptOut(
+        answers=answers,
+        current_index=getattr(sub, "current_index", 0) or 0,
+        flagged_ids=from_json_list(getattr(sub, "flagged_ids", None)),
+        remaining_seconds=remaining,
+        status=sub.status if sub.status in ("in_progress", "attended", "absent") else "in_progress",
+    )
+
+
 def _assessment_out(
     a: Assessment,
     *,
     student_submitted: bool = False,
+    attempt_in_progress: bool = False,
     student_id: str | None = None,
     db: Session | None = None,
 ) -> AssessmentOut:
@@ -88,7 +138,9 @@ def _assessment_out(
         question_paper_id=a.question_paper_id,
         paper_coverage=a.paper_coverage,  # type: ignore[arg-type]
         selected_topics=from_json_list(a.selected_topics) if a.selected_topics else None,
+        shuffle_questions=_shuffle_questions_flag(a),
         student_submitted=student_submitted,
+        attempt_in_progress=attempt_in_progress and not student_submitted,
         timing_over=timing_over,
         access_request_status=access_request_status,  # type: ignore[arg-type]
         can_attend=can_attend,
@@ -148,7 +200,8 @@ def _resolve_student_profile_id(db: Session, user: User, payload: dict, student_
     if role == "student":
         if not profile:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student profile not found")
-        if student_id != profile.id:
+        # Login user id and student profile id can differ; both refer to the same student.
+        if student_id not in {profile.id, user.id}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot view another student's assessments")
         return profile.id
     profile = db.get(StudentProfile, student_id)
@@ -175,8 +228,14 @@ def list_student_assessments(
         grade=grade,
     )
     return [
-        _assessment_out(a, student_submitted=submitted, student_id=sid, db=db)
-        for a, submitted in rows
+        _assessment_out(
+            a,
+            student_submitted=submitted,
+            attempt_in_progress=in_progress,
+            student_id=sid,
+            db=db,
+        )
+        for a, submitted, in_progress in rows
     ]
 
 
@@ -410,6 +469,7 @@ def create_assessment(
         question_paper_id=body.question_paper_id,
         paper_coverage=body.paper_coverage,
         selected_topics=to_json_list(body.selected_topics or []),
+        shuffle_questions=body.shuffle_questions,
     )
     db.add(assessment)
     db.commit()
@@ -484,6 +544,90 @@ def get_my_submission(
     )
 
 
+@router.get("/assessments/{assessment_id}/attempt", response_model=AssessmentAttemptOut)
+def get_exam_attempt(
+    assessment_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("student")),
+) -> AssessmentAttemptOut:
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment or assessment.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    profile = _student_profile_or_400(db, user)
+    _assert_student_assigned(assessment, profile)
+    sub = existing_attempt(db, assessment_id, profile.id)
+    if sub and sub.status in ("attended", "absent"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Assessment already submitted. Results will be shared later.",
+        )
+    return _attempt_out(sub if sub and sub.status == "in_progress" else None)
+
+
+@router.put("/assessments/{assessment_id}/attempt", response_model=AssessmentAttemptOut)
+def save_exam_attempt(
+    assessment_id: str,
+    body: AssessmentAttemptSave,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("student")),
+) -> AssessmentAttemptOut:
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment or assessment.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    profile = _student_profile_or_400(db, user)
+    _assert_student_assigned(assessment, profile)
+    if existing_submission(db, assessment_id, profile.id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Assessment already submitted")
+    if is_past_deadline(assessment, profile.id, db) and not has_approved_extension(
+        db, assessment_id, profile.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Exam timing over. Request reassignment from your tutor or CSC center.",
+        )
+    if not can_student_attend(db, assessment, profile.id) and assessment.mode != "practice":
+        if assessment.status != "live":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Assessment is not live yet. Wait for your tutor to start it.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot attend this assessment at this time.",
+        )
+
+    payload = [
+        {"questionId": item.question_id, "selectedOption": item.selected_option} for item in body.answers
+    ]
+    remaining = body.remaining_seconds if body.remaining_seconds is not None else 0
+    sub = existing_attempt(db, assessment_id, profile.id)
+    if sub is None:
+        sub = AssessmentSubmission(
+            id=f"sub-{uuid.uuid4().hex[:8]}",
+            assessment_id=assessment_id,
+            student_id=profile.id,
+            score=0,
+            max_score=0,
+            time_spent_min=0,
+            submitted_at="",
+            status="in_progress",
+            answers=json.dumps(payload),
+            remaining_seconds=remaining,
+            current_index=max(0, body.current_index),
+            flagged_ids=to_json_list(body.flagged_ids),
+        )
+        db.add(sub)
+    else:
+        sub.status = "in_progress"
+        sub.answers = json.dumps(payload)
+        sub.remaining_seconds = remaining
+        sub.current_index = max(0, body.current_index)
+        sub.flagged_ids = to_json_list(body.flagged_ids)
+    db.commit()
+    db.refresh(sub)
+    return _attempt_out(sub)
+
+
 @router.post("/assessments/{assessment_id}/submit", response_model=AssessmentSubmissionOut)
 def submit_assessment(
     assessment_id: str,
@@ -540,18 +684,28 @@ def submit_assessment(
             score += q.marks
 
     submitted_at = datetime.now().isoformat(timespec="minutes")
-    submission = AssessmentSubmission(
-        id=f"sub-{uuid.uuid4().hex[:8]}",
-        assessment_id=assessment_id,
-        student_id=profile.id,
-        score=score,
-        max_score=max_score,
-        time_spent_min=body.time_spent_min,
-        submitted_at=submitted_at,
-        status="attended",
-        answers=json.dumps(body.answers),
-    )
-    db.add(submission)
+    submission = existing_attempt(db, assessment_id, profile.id)
+    if submission is None:
+        submission = AssessmentSubmission(
+            id=f"sub-{uuid.uuid4().hex[:8]}",
+            assessment_id=assessment_id,
+            student_id=profile.id,
+            score=score,
+            max_score=max_score,
+            time_spent_min=body.time_spent_min,
+            submitted_at=submitted_at,
+            status="attended",
+            answers=json.dumps(body.answers),
+        )
+        db.add(submission)
+    else:
+        submission.score = score
+        submission.max_score = max_score
+        submission.time_spent_min = body.time_spent_min
+        submission.submitted_at = submitted_at
+        submission.status = "attended"
+        submission.answers = json.dumps(body.answers)
+        submission.remaining_seconds = 0
     update_student_profile_after_submission(db, profile, score, max_score, submitted_at)
     update_assessment_class_avg(db, assessment_id)
     db.flush()
@@ -590,12 +744,12 @@ def get_attendance(
     for sid in invited:
         profile = db.get(StudentProfile, sid)
         sub = submissions.get(sid)
-        if sub:
+        if sub and sub.status in ("attended", "absent"):
             records.append(
                 AttendanceRecordOut(
                     student_id=sid,
                     student_name=profile.user.name if profile else sid,
-                    status="attended",
+                    status=sub.status if sub.status == "absent" else "attended",
                     score=sub.score,
                     max_score=sub.max_score,
                     time_spent_min=sub.time_spent_min,

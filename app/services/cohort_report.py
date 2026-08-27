@@ -107,6 +107,7 @@ def _score_events_for_cohort(
     subs = (
         db.query(AssessmentSubmission)
         .filter(AssessmentSubmission.student_id.in_(student_ids))
+        .filter(AssessmentSubmission.status.in_(("attended", "absent")))
         .order_by(AssessmentSubmission.submitted_at.asc())
         .all()
     )
@@ -165,7 +166,7 @@ def _student_assessment_attendance(
             )
             .first()
         )
-        if sub:
+        if sub and sub.status in ("attended", "absent"):
             submitted += 1
     absent = max(0, invited - submitted)
     pct = round((submitted / invited) * 100) if invited else 100
@@ -432,28 +433,83 @@ def _assign_clusters(students_by_name: dict[str, dict]) -> dict[str, list[str]]:
     return {k: v for k, v in clusters.items() if v}
 
 
-def _concepts_from_score_events(events: list[dict]) -> list[dict]:
-    by_subject: dict[str, list[int]] = defaultdict(list)
-    for ev in events:
-        by_subject[ev["subject"]].append(ev["pct"])
-    rows = [
-        {"concept": f"Class average · {subject}", "subject": subject, "masteryPct": round(mean(pcts))}
-        for subject, pcts in by_subject.items()
+def _knowledge_summary(topics: list[dict], *, student_name: str | None = None) -> str:
+    if not topics:
+        if student_name:
+            return (
+                f"Topic-level mastery for {student_name} will appear once assessments "
+                "with tagged questions have been taken."
+            )
+        return (
+            "Topic-level mastery will appear once assessments with tagged questions "
+            "have been taken in this batch."
+        )
+    avg = round(mean(int(t["masteryPct"]) for t in topics))
+    weak = sorted(
+        [t for t in topics if int(t["masteryPct"]) < 55],
+        key=lambda t: int(t["masteryPct"]),
+    )
+    strong = sorted(
+        [t for t in topics if int(t["masteryPct"]) >= 75],
+        key=lambda t: -int(t["masteryPct"]),
+    )
+    who = f"{student_name}'s topic mastery" if student_name else "Class topic mastery"
+    parts = [
+        f"{who} averages {avg}% across {len(topics)} assessed topic"
+        f"{'' if len(topics) == 1 else 's'}."
     ]
-    rows.sort(key=lambda r: r["masteryPct"])
-    return [r for r in rows if r["masteryPct"] < 55][:8]
+    if strong:
+        names = ", ".join(f"{t['concept']} ({t['masteryPct']}%)" for t in strong[:3])
+        parts.append(f"Strongest: {names}.")
+    if weak:
+        names = ", ".join(f"{t['concept']} ({t['masteryPct']}%)" for t in weak[:3])
+        parts.append(f"Needs attention: {names}.")
+    else:
+        parts.append("No topics sit below the 55% mastery threshold.")
+    return " ".join(parts)
 
 
-def _concepts_not_mastered(db: Session, institution_id: str, batch: Batch | None) -> list[dict]:
+def _topic_rows_from_mastery(topics: list[dict]) -> list[dict]:
+    scored = [
+        t
+        for t in topics
+        if int(t.get("answers") or 0) > 0 or int(t.get("mastery") or 0) > 0
+    ]
+    scored.sort(key=lambda t: (t["subject"], t.get("chapter") or "", t["topic"]))
+    return [
+        {
+            "concept": t["topic"],
+            "subject": t["subject"],
+            "chapter": t.get("chapter") or "",
+            "masteryPct": t["mastery"],
+        }
+        for t in scored
+    ]
+
+
+def _topic_knowledge_layer(db: Session, institution_id: str, batch: Batch | None) -> tuple[list[dict], str]:
     topics = _topic_mastery_rows(db, institution_id)
     if batch:
-        topics = [t for t in topics if t["board"] == batch.board and t["grade"] == batch.grade]
-    weak = [t for t in topics if t["mastery"] < 55]
-    weak.sort(key=lambda t: t["mastery"])
-    return [
-        {"concept": t["topic"], "subject": t["subject"], "masteryPct": t["mastery"]}
-        for t in weak[:8]
-    ]
+        from app.services.syllabus_books import boards_match, grades_match
+
+        topics = [
+            t
+            for t in topics
+            if boards_match(t["board"], batch.board) and grades_match(t["grade"], batch.grade)
+        ]
+    rows = _topic_rows_from_mastery(topics)
+    return rows, _knowledge_summary(rows)
+
+
+def _student_knowledge_layer(
+    db: Session,
+    institution_id: str,
+    student_id: str,
+    student_name: str,
+) -> tuple[list[dict], str]:
+    topics = _topic_mastery_rows(db, institution_id, student_id=student_id)
+    rows = _topic_rows_from_mastery(topics)
+    return rows, _knowledge_summary(rows, student_name=student_name)
 
 
 def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = None) -> dict:
@@ -474,7 +530,9 @@ def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = N
             },
             "clusters": {},
             "students": {},
-            "conceptsNotMastered": _concepts_not_mastered(db, institution_id, batch),
+            "conceptsNotMastered": [],
+            "topicMastery": [],
+            "knowledgeSummary": _knowledge_summary([]),
             "dataSource": "empty",
         }
 
@@ -517,9 +575,8 @@ def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = N
     assessment_count = sum(1 for e in events if e["source"] == "assessment")
     marks_count = sum(1 for e in events if e["source"] == "marks")
 
-    concepts = _concepts_from_score_events(events) if events else []
-    if not concepts:
-        concepts = _concepts_not_mastered(db, institution_id, batch)
+    topic_mastery, knowledge_summary = _topic_knowledge_layer(db, institution_id, batch)
+    weak_concepts = [t for t in topic_mastery if int(t["masteryPct"]) < 55][:12]
 
     return {
         "batchId": batch.id,
@@ -540,7 +597,9 @@ def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = N
         },
         "clusters": _assign_clusters(students) if students else {},
         "students": students,
-        "conceptsNotMastered": concepts,
+        "conceptsNotMastered": weak_concepts,
+        "topicMastery": topic_mastery,
+        "knowledgeSummary": knowledge_summary,
         "dataSource": "live" if events else "empty",
     }
 
@@ -594,6 +653,8 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
             "batchLabel": f"{profile.batch} · {profile.board} · {profile.grade}" if profile.batch else None,
             "source": "empty",
             "message": "No assessment results or saved marks yet for this student.",
+            "topicMastery": [],
+            "knowledgeSummary": _knowledge_summary([], student_name=profile.user.name),
         }
 
     total = len(_batch_student_ids(db, batch.id)) if batch else 1
@@ -629,6 +690,10 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         f"வகுப்பில் #{rank} இடம். விரிவான பகுப்பாய்வுக்கு CSC மையத்தை அணுகவும்."
     )
 
+    topic_mastery, knowledge_summary = _student_knowledge_layer(
+        db, institution_id, student_id, profile.user.name
+    )
+
     return {
         "name": profile.user.name,
         "profile": genome,
@@ -638,4 +703,6 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         "narrative": ai_narrative,
         "narrativeTa": ai_narrative_ta or rule_narrative_ta,
         "narrativeSource": "vertex" if ai_narrative else "rule-based",
+        "topicMastery": topic_mastery,
+        "knowledgeSummary": knowledge_summary,
     }

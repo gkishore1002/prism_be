@@ -1,6 +1,6 @@
 from app.models.academic import Board, Chapter, Grade, Question, Subject, Topic
 from app.models.assessment import Assessment, AssessmentStudentReport, AssessmentSubmission
-from app.models.content import Batch, BatchStudent, QuestionPaper
+from app.models.content import Batch, BatchStudent, QuestionPaper, SyllabusBook
 from app.models.institution import Center, Institution
 from app.models.marks import MarksEntry
 from app.models.notification import Notification
@@ -27,6 +27,7 @@ __all__ = [
     "Batch",
     "BatchStudent",
     "QuestionPaper",
+    "SyllabusBook",
     "Assessment",
     "AssessmentSubmission",
     "AssessmentStudentReport",

@@ -3,7 +3,11 @@
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
-from app.db.tenant import ensure_institution_schema_name as _ensure_institution_schema_name
+from app.db.tenant import (
+    ensure_institution_schema_name as _ensure_institution_schema_name,
+    is_multi_schema_enabled,
+    patch_all_tenant_schemas,
+)
 
 
 def _table_columns(engine: Engine, table_name: str) -> set[str]:
@@ -69,6 +73,40 @@ def ensure_assessment_student_reports(engine: Engine) -> None:
                 """
             )
         )
+
+
+def ensure_assessment_shuffle_questions(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("assessments", schema=schema_kw):
+        return
+    columns = {c["name"] for c in inspector.get_columns("assessments", schema=schema_kw)}
+    if "shuffle_questions" in columns:
+        return
+    table = f"{schema}.assessments" if schema_kw else "assessments"
+    default = _bool_default(engine, sqlite_value="0")
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"ALTER TABLE {table} ADD COLUMN shuffle_questions BOOLEAN NOT NULL DEFAULT {default}")
+        )
+
+
+def ensure_assessment_attempt_progress(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("assessment_submissions", schema=schema_kw):
+        return
+    columns = {c["name"] for c in inspector.get_columns("assessment_submissions", schema=schema_kw)}
+    table = f"{schema}.assessment_submissions" if schema_kw else "assessment_submissions"
+    with engine.begin() as conn:
+        if "remaining_seconds" not in columns:
+            conn.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN remaining_seconds INTEGER NOT NULL DEFAULT 0")
+            )
+        if "current_index" not in columns:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN current_index INTEGER NOT NULL DEFAULT 0"))
+        if "flagged_ids" not in columns:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN flagged_ids TEXT NOT NULL DEFAULT '[]'"))
 
 
 def ensure_assessment_available_until(engine: Engine) -> None:
@@ -282,6 +320,36 @@ def ensure_user_center_access(engine: Engine) -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_user_center_access_center_id ON user_center_access (center_id)"))
 
 
+def ensure_syllabus_books(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("syllabus_books", schema=schema_kw):
+        return
+    table = f"{schema}.syllabus_books" if schema_kw else "syllabus_books"
+    inst_fk = "public.institutions(id)" if engine.dialect.name == "postgresql" else "institutions(id)"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    institution_id VARCHAR(32) NOT NULL REFERENCES {inst_fk},
+                    board VARCHAR(64) NOT NULL,
+                    grade VARCHAR(64) NOT NULL,
+                    subject VARCHAR(128) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    filename VARCHAR(255) NOT NULL DEFAULT '',
+                    status VARCHAR(16) NOT NULL DEFAULT 'analyzing',
+                    analysis_json TEXT NOT NULL DEFAULT '{{}}',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    created_by VARCHAR(32),
+                    created_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+
+
 def ensure_system_initialization(engine: Engine) -> None:
     if inspect(engine).has_table("system_initialization"):
         return
@@ -303,6 +371,12 @@ def run_migrations(engine: Engine) -> None:
     ensure_batch_schedule_timing(engine)
     ensure_assessment_student_reports(engine)
     ensure_assessment_available_until(engine)
+    ensure_assessment_shuffle_questions(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_assessment_shuffle_questions)
+    ensure_assessment_attempt_progress(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_assessment_attempt_progress)
     ensure_student_csc_fields(engine)
     ensure_assessment_access_requests(engine)
     ensure_report_collection_logs(engine)
@@ -317,4 +391,7 @@ def run_migrations(engine: Engine) -> None:
     ensure_center_code(engine)
     ensure_user_center_access(engine)
     ensure_system_initialization(engine)
+    ensure_syllabus_books(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_syllabus_books)
     _ensure_institution_schema_name(engine)

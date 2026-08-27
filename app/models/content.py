@@ -41,3 +41,22 @@ class QuestionPaper(Base):
     created_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     source: Mapped[str] = mapped_column(String(16), default="upload")
     parent_paper_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class SyllabusBook(Base):
+    """Uploaded textbook whose Vertex outline (chapters/topics) is stored as JSON."""
+
+    __tablename__ = "syllabus_books"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
+    board: Mapped[str] = mapped_column(String(64))
+    grade: Mapped[str] = mapped_column(String(64))
+    subject: Mapped[str] = mapped_column(String(128))
+    title: Mapped[str] = mapped_column(String(255))
+    filename: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(16), default="analyzing")
+    analysis_json: Mapped[str] = mapped_column(Text, default="{}")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[str] = mapped_column(String(32), default="")

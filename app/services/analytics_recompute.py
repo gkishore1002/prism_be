@@ -70,6 +70,7 @@ def student_score_events(db: Session, institution_id: str, student_id: str) -> l
         .filter(
             Assessment.institution_id == institution_id,
             AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status.in_(("attended", "absent")),
         )
         .all()
     )
@@ -105,7 +106,10 @@ def _topic_answer_stats(
     q = (
         db.query(AssessmentSubmission)
         .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
-        .filter(Assessment.institution_id == institution_id)
+        .filter(
+            Assessment.institution_id == institution_id,
+            AssessmentSubmission.status == "attended",
+        )
     )
     if student_ids is not None:
         q = q.filter(AssessmentSubmission.student_id.in_(student_ids))
@@ -178,6 +182,7 @@ def topic_mastery_rows(
                         else:
                             mastery = 0
                         q_count = db.query(Question).filter(Question.topic_id == topic.id).count()
+                        answer_count = len(attempts) if student_id else sum(len(v) for v in per_student.values())
                         rows.append(
                             {
                                 "board": board.name,
@@ -187,6 +192,7 @@ def topic_mastery_rows(
                                 "topic": topic.name,
                                 "topic_id": topic.id,
                                 "questions": q_count,
+                                "answers": answer_count,
                                 "mastery": min(100, max(0, mastery)),
                             }
                         )
@@ -252,6 +258,74 @@ def submission_topic_tags(db: Session, institution_id: str, student_id: str, sub
             if label not in weak:
                 weak.append(label)
     return strong[:3], weak[:3]
+
+
+def submission_topic_breakdown(db: Session, submission: AssessmentSubmission | None) -> list[dict]:
+    """Per-topic accuracy for one exam attempt."""
+    if submission is None:
+        return []
+    try:
+        answers = json.loads(submission.answers or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(answers, list):
+        return []
+
+    buckets: dict[str, dict] = {}
+    for ans in answers:
+        if not isinstance(ans, dict):
+            continue
+        qid = dict_get(ans, "question_id", "questionId")
+        if not qid:
+            continue
+        question = db.get(Question, qid)
+        if not question:
+            continue
+        selected = dict_get(ans, "selected_option", "selectedOption", default="")
+        correct = bool(
+            question.correct_answer
+            and selected
+            and str(selected).upper() == question.correct_answer.upper()
+        )
+        concept = (question.topic_name or "").strip()
+        subject = (question.subject or "").strip()
+        chapter = (question.chapter or "").strip()
+        if question.topic_id:
+            topic_row = db.get(Topic, question.topic_id)
+            if topic_row:
+                if not concept:
+                    concept = (topic_row.name or "").strip()
+                if topic_row.chapter:
+                    if not chapter:
+                        chapter = (topic_row.chapter.name or "").strip()
+                    if not subject and topic_row.chapter.subject:
+                        subject = (topic_row.chapter.subject.name or "").strip()
+        if not concept:
+            concept = "Untagged"
+        key = f"{subject}|{chapter}|{concept}"
+        rec = buckets.setdefault(
+            key,
+            {"concept": concept, "subject": subject, "chapter": chapter, "correct": 0, "total": 0},
+        )
+        rec["total"] += 1
+        if correct:
+            rec["correct"] += 1
+
+    rows = []
+    for rec in buckets.values():
+        total = int(rec["total"]) or 1
+        rows.append(
+            {
+                "concept": rec["concept"],
+                "subject": rec["subject"],
+                "chapter": rec["chapter"],
+                "correct": rec["correct"],
+                "total": rec["total"],
+                "masteryPct": round((rec["correct"] / total) * 100),
+            }
+        )
+    rows.sort(key=lambda item: (item["masteryPct"], item["concept"]))
+    return rows
 
 
 def recompute_student_profile(db: Session, student_id: str) -> StudentProfile | None:

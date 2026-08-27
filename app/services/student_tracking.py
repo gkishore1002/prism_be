@@ -88,6 +88,7 @@ def student_tracking_payload(db: Session, profile: StudentProfile) -> dict:
         db.query(AssessmentSubmission, Assessment)
         .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
         .filter(AssessmentSubmission.student_id == profile.id)
+        .filter(AssessmentSubmission.status.in_(("attended", "absent")))
         .order_by(AssessmentSubmission.submitted_at.desc())
         .all()
     )

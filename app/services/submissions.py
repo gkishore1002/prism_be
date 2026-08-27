@@ -6,6 +6,8 @@ from app.models.assessment import Assessment, AssessmentSubmission
 from app.models.user import StudentProfile
 from app.services.analytics_recompute import recompute_student_profile
 
+FINAL_SUBMISSION_STATUSES = ("attended", "absent")
+
 
 def update_student_profile_after_submission(
     db: Session,
@@ -17,7 +19,7 @@ def update_student_profile_after_submission(
     recompute_student_profile(db, profile.id)
 
 
-def existing_submission(
+def existing_attempt(
     db: Session, assessment_id: str, student_id: str
 ) -> AssessmentSubmission | None:
     return (
@@ -30,6 +32,21 @@ def existing_submission(
     )
 
 
+def existing_submission(
+    db: Session, assessment_id: str, student_id: str
+) -> AssessmentSubmission | None:
+    """Final (scored) submission only — in-progress drafts do not count."""
+    return (
+        db.query(AssessmentSubmission)
+        .filter(
+            AssessmentSubmission.assessment_id == assessment_id,
+            AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status.in_(FINAL_SUBMISSION_STATUSES),
+        )
+        .first()
+    )
+
+
 def update_assessment_class_avg(db: Session, assessment_id: str) -> None:
     assessment = db.get(Assessment, assessment_id)
     if not assessment:
@@ -37,7 +54,10 @@ def update_assessment_class_avg(db: Session, assessment_id: str) -> None:
 
     submissions = (
         db.query(AssessmentSubmission)
-        .filter(AssessmentSubmission.assessment_id == assessment_id)
+        .filter(
+            AssessmentSubmission.assessment_id == assessment_id,
+            AssessmentSubmission.status == "attended",
+        )
         .all()
     )
     percentages = [
@@ -47,3 +67,4 @@ def update_assessment_class_avg(db: Session, assessment_id: str) -> None:
     ]
     assessment.class_avg = round(sum(percentages) / len(percentages)) if percentages else None
     db.add(assessment)
+

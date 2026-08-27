@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     vertex_model: str = "gemini-2.5-flash"
     vertex_summary_cache_ttl: int = 300
     vertex_request_timeout_seconds: int = 12
+    vertex_book_timeout_seconds: int = 180
+    vertex_topic_map_timeout_seconds: int = 90
+    google_api_key: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:

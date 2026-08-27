@@ -565,6 +565,48 @@ class QuestionPaperUpdate(CamelModel):
     question_ids: list[str] | None = None
 
 
+class SyllabusBookOut(CamelModel):
+    id: str
+    board: str
+    grade: str
+    subject: str
+    title: str
+    filename: str
+    status: Literal["analyzing", "analyzed", "failed"]
+    analysis_json: dict | None = None
+    error_message: str = ""
+    created_by: str | None = None
+    created_at: str = ""
+    chapter_count: int = 0
+    topic_count: int = 0
+
+
+class TopicMapQuestionIn(CamelModel):
+    row: int
+    board: str
+    grade: str
+    subject: str
+    chapter: str
+    text: str
+    topic: str = ""
+
+
+class TopicMapRequest(CamelModel):
+    questions: list[TopicMapQuestionIn]
+
+
+class TopicMapItemOut(CamelModel):
+    row: int
+    topic: str
+    chapter: str = ""
+
+
+class TopicMapResponse(CamelModel):
+    mappings: list[TopicMapItemOut]
+    book_ids: list[str] = Field(default_factory=list)
+    used_heuristic: bool = False
+
+
 class AssessmentOut(CamelModel):
     id: str
     title: str
@@ -589,7 +631,9 @@ class AssessmentOut(CamelModel):
     question_paper_id: str | None = None
     paper_coverage: Literal["full", "selected_topics"] | None = None
     selected_topics: list[str] | None = None
+    shuffle_questions: bool = False
     student_submitted: bool = False
+    attempt_in_progress: bool = False
     timing_over: bool = False
     access_request_status: Literal["pending", "approved", "rejected"] | None = None
     can_attend: bool = False
@@ -616,6 +660,7 @@ class AssessmentCreate(CamelModel):
     question_paper_id: str | None = None
     paper_coverage: Literal["full", "selected_topics"] | None = None
     selected_topics: list[str] | None = None
+    shuffle_questions: bool = False
 
 
 class AssessmentUpdate(CamelModel):
@@ -738,6 +783,26 @@ class AssessmentSubmissionCreate(CamelModel):
     time_spent_min: int = 0
 
 
+class AssessmentAttemptAnswer(CamelModel):
+    question_id: str
+    selected_option: str = ""
+
+
+class AssessmentAttemptSave(CamelModel):
+    answers: list[AssessmentAttemptAnswer] = Field(default_factory=list)
+    current_index: int = 0
+    flagged_ids: list[str] = Field(default_factory=list)
+    remaining_seconds: int | None = None
+
+
+class AssessmentAttemptOut(CamelModel):
+    answers: list[AssessmentAttemptAnswer] = Field(default_factory=list)
+    current_index: int = 0
+    flagged_ids: list[str] = Field(default_factory=list)
+    remaining_seconds: int | None = None
+    status: Literal["in_progress", "attended", "absent"] = "in_progress"
+
+
 class AssessmentSubmissionOut(CamelModel):
     id: str
     assessment_id: str
@@ -746,7 +811,7 @@ class AssessmentSubmissionOut(CamelModel):
     max_score: int
     time_spent_min: int
     submitted_at: str
-    status: Literal["attended", "absent", "pending"]
+    status: Literal["attended", "absent", "pending", "in_progress"]
 
 
 class AttendanceRecordOut(CamelModel):

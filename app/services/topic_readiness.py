@@ -198,6 +198,7 @@ def _collect_student_attempts(
         .filter(
             Assessment.institution_id == institution_id,
             AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status == "attended",
         )
         .all()
     )

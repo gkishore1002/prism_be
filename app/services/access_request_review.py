@@ -42,7 +42,10 @@ def _student_performance(db: Session, student_id: str) -> dict:
 
     submissions = (
         db.query(AssessmentSubmission)
-        .filter(AssessmentSubmission.student_id == student_id)
+        .filter(
+            AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status.in_(("attended", "absent")),
+        )
         .all()
     )
     previous_attempts = len(submissions)

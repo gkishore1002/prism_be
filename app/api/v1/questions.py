@@ -22,6 +22,7 @@ from app.schemas import (
     QuestionUpdate,
 )
 from app.utils import from_json_list, to_json_list
+from app.services.syllabus_books import fill_blank_question_topics
 
 router = APIRouter(tags=["questions", "question-papers"], route_class=CamelCaseAPIRoute)
 
@@ -111,7 +112,13 @@ def _normalize_grade(grade: str) -> str:
 
 def _persist_question(db: Session, institution_id: str, body: QuestionCreate) -> Question:
     topic = _find_or_create_topic(
-        db, institution_id, body.board, body.grade, body.subject, body.topic
+        db,
+        institution_id,
+        body.board,
+        body.grade,
+        body.subject,
+        body.topic,
+        chapter_name=body.chapter,
     )
     qid = f"q-{uuid.uuid4().hex[:8]}"
     question = Question(
@@ -272,12 +279,16 @@ def create_question_paper_bulk(
     if not body.questions:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one question is required")
 
-    created: list[Question] = []
     for idx, q_body in enumerate(body.questions, start=1):
         if not q_body.text.strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Question {idx}: text is required",
+            )
+        if not q_body.chapter.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Question {idx}: chapter is required",
             )
         if q_body.question_type == "mcq":
             if not q_body.option_a or not q_body.option_b:
@@ -290,7 +301,9 @@ def create_question_paper_bulk(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Question {idx}: correct answer is required for MCQs",
                 )
-        created.append(_persist_question(db, user.institution_id, q_body))
+
+    questions = fill_blank_question_topics(db, user.institution_id, list(body.questions))
+    created: list[Question] = [_persist_question(db, user.institution_id, q_body) for q_body in questions]
 
     db.flush()
     first = created[0]

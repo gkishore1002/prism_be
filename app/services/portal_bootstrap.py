@@ -20,7 +20,12 @@ def _resolve_student_id(db: Session, user: User) -> str:
     return profile.id
 
 
-def _assessment_dict(a: Assessment, *, student_submitted: bool = False) -> dict:
+def _assessment_dict(
+    a: Assessment,
+    *,
+    student_submitted: bool = False,
+    attempt_in_progress: bool = False,
+) -> dict:
     return AssessmentOut(
         id=a.id,
         title=a.title,
@@ -45,7 +50,9 @@ def _assessment_dict(a: Assessment, *, student_submitted: bool = False) -> dict:
         question_paper_id=a.question_paper_id,
         paper_coverage=a.paper_coverage,  # type: ignore[arg-type]
         selected_topics=from_json_list(a.selected_topics) if a.selected_topics else None,
+        shuffle_questions=bool(getattr(a, "shuffle_questions", False)),
         student_submitted=student_submitted,
+        attempt_in_progress=attempt_in_progress and not student_submitted,
     ).model_dump(by_alias=True)
 
 
@@ -73,7 +80,10 @@ def _notifications_for_role(db: Session, institution_id: str, role: str) -> list
 
 def _assessments_for_student(db: Session, institution_id: str, student_id: str) -> list[dict]:
     rows = list_assessments_for_student(db, institution_id, student_id)
-    return [_assessment_dict(a, student_submitted=submitted) for a, submitted in rows]
+    return [
+        _assessment_dict(a, student_submitted=submitted, attempt_in_progress=in_progress)
+        for a, submitted, in_progress in rows
+    ]
 
 
 def _all_assessments(db: Session, institution_id: str) -> list[dict]:

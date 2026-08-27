@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -32,6 +32,7 @@ class Assessment(Base):
     question_paper_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     paper_coverage: Mapped[str | None] = mapped_column(String(32), nullable=True)
     selected_topics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    shuffle_questions: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class AssessmentSubmission(Base):
@@ -47,6 +48,9 @@ class AssessmentSubmission(Base):
     submitted_at: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(16), default="attended")
     answers: Mapped[str] = mapped_column(Text, default="[]")  # JSON
+    remaining_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    current_index: Mapped[int] = mapped_column(Integer, default=0)
+    flagged_ids: Mapped[str] = mapped_column(Text, default="[]")
 
 
 class AssessmentStudentReport(Base):

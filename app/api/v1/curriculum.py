@@ -116,7 +116,13 @@ def _build_curriculum_tree(db: Session, institution_id: str) -> list[CurriculumB
 
 
 def _find_or_create_topic(
-    db: Session, institution_id: str, board: str, grade: str, subject: str, topic_name: str
+    db: Session,
+    institution_id: str,
+    board: str,
+    grade: str,
+    subject: str,
+    topic_name: str,
+    chapter_name: str | None = None,
 ) -> Topic:
     board_row = (
         db.query(Board)
@@ -156,15 +162,18 @@ def _find_or_create_topic(
         db.add(subject_row)
         db.flush()
 
+    chapter_label = (chapter_name or "").strip() or subject
     chapter_row = (
-        db.query(Chapter).filter(Chapter.subject_id == subject_row.id).first()
+        db.query(Chapter)
+        .filter(Chapter.subject_id == subject_row.id, Chapter.name == chapter_label)
+        .first()
     )
     if not chapter_row:
         chapter_row = Chapter(
-            id=_compact_row_id(db, Chapter, "ch", subject_row.id, subject),
+            id=_compact_row_id(db, Chapter, "ch", subject_row.id, chapter_label),
             subject_id=subject_row.id,
-            name=subject,
-            order=1,
+            name=chapter_label,
+            order=db.query(Chapter).filter(Chapter.subject_id == subject_row.id).count() + 1,
         )
         db.add(chapter_row)
         db.flush()
