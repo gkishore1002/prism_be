@@ -642,10 +642,6 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
             "status": _health_status(t["mastery"]),
         }
         for t in ranked[:24]
-    health = get_student_health(db, student_id)
-    return [
-        {"name": s["subjectName"], "health": s["health"], "status": s["status"]}
-        for s in health["subjects"]
     ]
 
 
