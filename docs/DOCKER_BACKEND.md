@@ -151,6 +151,29 @@ Then re-upload the textbook. Failed books are not retried automatically (the fil
 
 ---
 
+## Render (production) — do not deploy Compose
+
+`docker-compose.backend.yml` is **local only**. On Render, split the stack:
+
+```text
+Render Web Service  →  this Dockerfile (FastAPI)
+Render PostgreSQL   →  managed database
+```
+
+Set secrets in the Render dashboard (never commit them):
+
+| Variable | Notes |
+|----------|--------|
+| `DATABASE_URL` | Internal Postgres URL from Render (SQLAlchemy driver is added automatically) |
+| `SECRET_KEY` | Random JWT signing key |
+| `CORS_ORIGINS` | Production frontend origin(s), comma-separated |
+| `SEED_DEMO` | `false` |
+| `GEMINI_API_KEY` | Optional; do not upload ADC JSON or service-account files |
+
+The container listens on `0.0.0.0:$PORT` (Render injects `PORT`).
+
+---
+
 ## Troubleshooting
 
 | Issue | Fix |

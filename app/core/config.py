@@ -1,4 +1,15 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def normalize_database_url(url: str) -> str:
+    """Accept Render/libpq URLs and SQLAlchemy+psycopg3 URLs."""
+    value = (url or "").strip()
+    if value.startswith("postgres://"):
+        value = "postgresql://" + value[len("postgres://") :]
+    if value.startswith("postgresql://"):
+        value = "postgresql+psycopg://" + value[len("postgresql://") :]
+    return value
 
 
 class Settings(BaseSettings):
@@ -48,6 +59,13 @@ class Settings(BaseSettings):
     vertex_book_timeout_seconds: int = 180
     vertex_topic_map_timeout_seconds: int = 90
     google_api_key: str = ""
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _normalize_database_url(cls, value: object) -> object:
+        if isinstance(value, str):
+            return normalize_database_url(value)
+        return value
 
     @property
     def cors_origin_list(self) -> list[str]:

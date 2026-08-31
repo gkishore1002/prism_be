@@ -1,7 +1,14 @@
-# Prism — backend + Postgres
+# Prism — LOCAL / DEV ONLY: FastAPI + PostgreSQL on your machine.
+# Do not deploy this Compose file to Render (or any host) as one stack.
+#
+# Production (Render):
+#   Web Service  → this Dockerfile (FastAPI)
+#   PostgreSQL   → Render managed Postgres
+#   Connect them with DATABASE_URL from Render's env vars — never commit secrets.
+#
 # Frontend runs separately in prism_fe
 #
-# Start:
+# Start locally:
 #   docker compose -f docker-compose.backend.yml up -d --build
 #
 # Frontend:
