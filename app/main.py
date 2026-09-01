@@ -50,6 +50,9 @@ async def lifespan(_: FastAPI):
             print_seed_credentials()
         elif settings.seed_demo:
             logger.info("Demo seed already present (super user + demo org)")
+        from app.services.platform_super_admins import ensure_platform_super_admin_if_missing
+
+        ensure_platform_super_admin_if_missing(db)
         if settings.auto_bootstrap:
             bootstrap_if_empty(db)
         backfill_initialization_for_legacy(db)

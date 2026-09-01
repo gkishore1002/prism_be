@@ -168,6 +168,9 @@ Set secrets in the Render dashboard (never commit them):
 | `SECRET_KEY` | Random JWT signing key |
 | `CORS_ORIGINS` | Production frontend origin(s), comma-separated |
 | `SEED_DEMO` | `false` |
+| `PLATFORM_SUPER_ADMIN_EMAIL` | First SYSTEM superuser email (one-time; skip if a superuser already exists) |
+| `PLATFORM_SUPER_ADMIN_PASSWORD` | Password for that account (min 8 chars). Do not commit. |
+| `PLATFORM_SUPER_ADMIN_NAME` | Optional display name |
 | `GEMINI_API_KEY` | Optional; do not upload ADC JSON or service-account files |
 
 The container listens on `0.0.0.0:$PORT` (Render injects `PORT`).

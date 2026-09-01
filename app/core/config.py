@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     seed_demo_student_email: str = "student@demo.com"
     seed_demo_password: str = "demo1234"
 
+    # One-time SYSTEM superuser (no demo org). Set both email + password on Render.
+    # Skipped if any public.super_admins row already exists.
+    platform_super_admin_email: str = ""
+    platform_super_admin_password: str = ""
+    platform_super_admin_name: str = "Platform Super Admin"
+
     # Default org code suggested during first-run /setup wizard (production custom orgs).
     default_organization_code: str = "CSC"
     auto_bootstrap: bool = False
