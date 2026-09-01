@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     secret_key: str = "dev-secret-key-change-in-production"
     access_token_expire_minutes: int = 1440
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174"
+    # Production frontends (Vercel) — used with allow_credentials.
+    cors_origin_regex: str = r"https://.*\.vercel\.app"
     demo_password: str = "demo123"
 
     # Swotify-style idempotent demo seed — on by default (set SEED_DEMO=false in production).
@@ -70,6 +72,11 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def cors_origin_regex_value(self) -> str | None:
+        value = (self.cors_origin_regex or "").strip()
+        return value or None
 
 
 settings = Settings()
