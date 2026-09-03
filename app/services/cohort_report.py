@@ -537,6 +537,32 @@ def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = N
         }
 
     events = _score_events_for_cohort(db, institution_id, batch, cohort)
+    if not events:
+        return {
+            "batchId": batch.id,
+            "batchName": batch.name,
+            "meta": {
+                "classAvg": 0,
+                "dates": [],
+                "subjSeq": list(SUBJECT_CODES),
+                "totalStudents": 0,
+                "batchStudentCount": len(cohort),
+                "scoredStudentCount": 0,
+                "assessmentResultCount": 0,
+                "savedMarksCount": 0,
+                "windowLabel": "No data yet",
+                "subjectsLabel": "—",
+                "totalMarks": 0,
+                "subjectsCount": 0,
+            },
+            "clusters": {},
+            "students": {},
+            "conceptsNotMastered": [],
+            "topicMastery": [],
+            "knowledgeSummary": _knowledge_summary([]),
+            "dataSource": "empty",
+        }
+
     by_student: dict[str, list[dict]] = defaultdict(list)
     for ev in events:
         by_student[ev["studentId"]].append(ev)

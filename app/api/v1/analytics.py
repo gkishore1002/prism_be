@@ -356,12 +356,15 @@ def student_genome(
 @router.get("/tutor/class-insights")
 def tutor_class_insights(
     center_id: str | None = Query(None),
+    batch_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
     payload: dict = Depends(get_token_payload),
 ) -> list:
     scope = _resolve_scope(db, user, payload, center_id)
-    return svc.get_class_insights(db, user.institution_id, center_ids=scope)
+    return svc.get_class_insights(
+        db, user.institution_id, center_ids=scope, batch_id=batch_id
+    )
 
 
 @router.get("/tutor/copilot")

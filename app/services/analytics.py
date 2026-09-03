@@ -982,9 +982,12 @@ def get_class_insights(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    batch_id: str | None = None,
 ) -> list[dict]:
     students = _students_for_scope(db, institution_id, center_ids)
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
+    if batch_id:
+        batches = [b for b in batches if b.id == batch_id]
     result = []
     for b in batches:
         ids = set(_batch_student_ids(db, b.id))
@@ -1001,6 +1004,7 @@ def get_class_insights(
         result.append(
             {
                 "id": f"ci-{b.id}",
+                "batchId": b.id,
                 "title": f"{b.name}: strengthen {weak_topic}",
                 "description": (
                     f"{b.board} · {b.grade} · {len(cohort)} students · "
