@@ -197,6 +197,39 @@ def delete_syllabus_book(
         db.commit()
 
 
+@router.post("/syllabus-books/{book_id}/import-topics", status_code=status.HTTP_200_OK)
+def import_book_topics_to_curriculum(
+    book_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> dict:
+    """Re-run persist_outline_to_curriculum for an already-analyzed book.
+
+    Idempotent — topics that already exist are skipped by _find_or_create_topic.
+    """
+    book = db.get(SyllabusBook, book_id)
+    if not book or book.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    if book.status != "analyzed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Book has not been analyzed yet. Wait until status is Analyzed.",
+        )
+    _, _, data = books_svc._outline_counts(book.analysis_json)  # noqa: SLF001
+    chapters = (data or {}).get("chapters") or []
+    if not chapters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No chapters found in the book outline.",
+        )
+    books_svc.persist_outline_to_curriculum(
+        db, user.institution_id, book.board, book.grade, book.subject, chapters
+    )
+    db.commit()
+    topic_count = sum(len(ch.get("topics") or [ch.get("title", "")]) for ch in chapters)
+    return {"status": "imported", "topicsAdded": topic_count}
+
+
 @router.post("/syllabus-books/map-topics", response_model=TopicMapResponse)
 def map_question_topics(
     body: TopicMapRequest,
