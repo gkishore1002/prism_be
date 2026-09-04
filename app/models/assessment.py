@@ -51,6 +51,36 @@ class AssessmentSubmission(Base):
     remaining_seconds: Mapped[int] = mapped_column(Integer, default=0)
     current_index: Mapped[int] = mapped_column(Integer, default=0)
     flagged_ids: Mapped[str] = mapped_column(Text, default="[]")
+    termination_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ExamSession(Base):
+    """Active take-exam session for single-device lock + heartbeat."""
+
+    __tablename__ = "exam_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assessment_id: Mapped[str] = mapped_column(ForeignKey("assessments.id"))
+    student_id: Mapped[str] = mapped_column(ForeignKey("student_profiles.id"))
+    device_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active|ended|terminated
+    started_at: Mapped[str] = mapped_column(String(32))
+    last_heartbeat_at: Mapped[str] = mapped_column(String(32), default="")
+    ended_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ExamViolation(Base):
+    __tablename__ = "exam_violations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("exam_sessions.id"))
+    assessment_id: Mapped[str] = mapped_column(ForeignKey("assessments.id"))
+    student_id: Mapped[str] = mapped_column(ForeignKey("student_profiles.id"))
+    violation_type: Mapped[str] = mapped_column(String(32))
+    occurred_at: Mapped[str] = mapped_column(String(32))
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AssessmentStudentReport(Base):

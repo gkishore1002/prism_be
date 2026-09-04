@@ -367,6 +367,89 @@ def ensure_system_initialization(engine: Engine) -> None:
         )
 
 
+def ensure_assessment_termination_reason(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("assessment_submissions", schema=schema_kw):
+        return
+    columns = {c["name"] for c in inspector.get_columns("assessment_submissions", schema=schema_kw)}
+    table = f"{schema}.assessment_submissions" if schema_kw else "assessment_submissions"
+    if "termination_reason" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN termination_reason VARCHAR(64)"))
+
+
+def ensure_exam_sessions(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("exam_sessions", schema=schema_kw):
+        return
+    table = f"{schema}.exam_sessions" if schema_kw else "exam_sessions"
+    assessments_ref = f"{schema}.assessments(id)" if schema_kw else "assessments(id)"
+    students_ref = f"{schema}.student_profiles(id)" if schema_kw else "student_profiles(id)"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    assessment_id VARCHAR(32) NOT NULL REFERENCES {assessments_ref},
+                    student_id VARCHAR(32) NOT NULL REFERENCES {students_ref},
+                    device_id VARCHAR(64) NOT NULL,
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    started_at VARCHAR(32) NOT NULL,
+                    last_heartbeat_at VARCHAR(32) NOT NULL DEFAULT '',
+                    ended_at VARCHAR(32),
+                    user_agent TEXT,
+                    ip_address VARCHAR(64)
+                )
+                """
+            )
+        )
+        idx = f"{schema}." if schema_kw else ""
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_exam_sessions_assessment_student "
+                f"ON {idx}exam_sessions (assessment_id, student_id)"
+            )
+        )
+
+
+def ensure_exam_violations(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("exam_violations", schema=schema_kw):
+        return
+    table = f"{schema}.exam_violations" if schema_kw else "exam_violations"
+    sessions_ref = f"{schema}.exam_sessions(id)" if schema_kw else "exam_sessions(id)"
+    assessments_ref = f"{schema}.assessments(id)" if schema_kw else "assessments(id)"
+    students_ref = f"{schema}.student_profiles(id)" if schema_kw else "student_profiles(id)"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    session_id VARCHAR(32) NOT NULL REFERENCES {sessions_ref},
+                    assessment_id VARCHAR(32) NOT NULL REFERENCES {assessments_ref},
+                    student_id VARCHAR(32) NOT NULL REFERENCES {students_ref},
+                    violation_type VARCHAR(32) NOT NULL,
+                    occurred_at VARCHAR(32) NOT NULL,
+                    user_agent TEXT
+                )
+                """
+            )
+        )
+        idx = f"{schema}." if schema_kw else ""
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_exam_violations_assessment_student "
+                f"ON {idx}exam_violations (assessment_id, student_id)"
+            )
+        )
+
+
 def run_migrations(engine: Engine) -> None:
     ensure_batch_schedule_timing(engine)
     ensure_assessment_student_reports(engine)
@@ -377,6 +460,15 @@ def run_migrations(engine: Engine) -> None:
     ensure_assessment_attempt_progress(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_assessment_attempt_progress)
+    ensure_assessment_termination_reason(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_assessment_termination_reason)
+    ensure_exam_sessions(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_exam_sessions)
+    ensure_exam_violations(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_exam_violations)
     ensure_student_csc_fields(engine)
     ensure_assessment_access_requests(engine)
     ensure_report_collection_logs(engine)

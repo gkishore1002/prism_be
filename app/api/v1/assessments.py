@@ -2,7 +2,7 @@ import json
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.questions import _question_out
@@ -26,13 +26,12 @@ from app.services.submissions import (
     existing_attempt,
     existing_submission,
     update_assessment_class_avg,
-    update_student_profile_after_submission,
 )
-from app.services.assessment_report import build_and_store_assessment_report
 from app.services.access_request_review import build_access_request_review_context
 from app.services.institution_policies import get_assessment_policy
 from app.services.notification_dispatch import notify_reassignment_requested, notify_reassignment_reviewed
 from app.services.audit_log import record_audit
+from app.services import exam_proctoring as proctor_svc
 from app.schemas import (
     AssessmentAccessRequestCreate,
     AssessmentAccessRequestOut,
@@ -45,11 +44,37 @@ from app.schemas import (
     AssessmentSubmissionOut,
     AssessmentUpdate,
     AttendanceRecordOut,
+    ExamSessionClaim,
+    ExamSessionHeartbeat,
+    ExamSessionOut,
+    ExamViolationCreate,
+    ExamViolationOut,
+    ExamViolationRecordOut,
     QuestionOut,
 )
 from app.utils import dict_get, from_json_list, to_json_list
 
 router = APIRouter(tags=["assessments"], route_class=CamelCaseAPIRoute)
+
+
+def _client_meta(request: Request) -> tuple[str | None, str | None]:
+    ua = request.headers.get("user-agent")
+    ip = request.client.host if request.client else None
+    return ua, ip
+
+
+def _submission_out(sub: AssessmentSubmission) -> AssessmentSubmissionOut:
+    return AssessmentSubmissionOut(
+        id=sub.id,
+        assessment_id=sub.assessment_id,
+        student_id=sub.student_id,
+        score=sub.score,
+        max_score=sub.max_score,
+        time_spent_min=sub.time_spent_min,
+        submitted_at=sub.submitted_at,
+        status=sub.status,  # type: ignore[arg-type]
+        termination_reason=getattr(sub, "termination_reason", None),
+    )
 
 
 def _shuffle_questions_flag(assessment: Assessment) -> bool:
@@ -596,6 +621,9 @@ def save_exam_attempt(
             detail="You cannot attend this assessment at this time.",
         )
 
+    if assessment.mode != "practice":
+        proctor_svc.assert_active_device_session(db, assessment, profile.id, body.device_id)
+
     payload = [
         {"questionId": item.question_id, "selectedOption": item.selected_option} for item in body.answers
     ]
@@ -626,6 +654,148 @@ def save_exam_attempt(
     db.commit()
     db.refresh(sub)
     return _attempt_out(sub)
+
+
+@router.post("/assessments/{assessment_id}/session", response_model=ExamSessionOut)
+def claim_exam_session(
+    assessment_id: str,
+    body: ExamSessionClaim,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("student")),
+) -> ExamSessionOut:
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment or assessment.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    if assessment.mode == "practice":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Exam sessions are not used for practice mode.",
+        )
+    profile = _student_profile_or_400(db, user)
+    _assert_student_assigned(assessment, profile)
+    if is_past_deadline(assessment, profile.id, db) and not has_approved_extension(
+        db, assessment_id, profile.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Exam timing over. Request reassignment from your tutor or CSC center.",
+        )
+    if not can_student_attend(db, assessment, profile.id):
+        if assessment.status != "live":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Assessment is not live yet. Wait for your tutor to start it.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot attend this assessment at this time.",
+        )
+    ua, ip = _client_meta(request)
+    session, count = proctor_svc.claim_session(
+        db,
+        assessment=assessment,
+        student_id=profile.id,
+        device_id=body.device_id,
+        user_agent=ua,
+        ip_address=ip,
+    )
+    return ExamSessionOut(
+        id=session.id,
+        assessment_id=session.assessment_id,
+        device_id=session.device_id,
+        status=session.status,  # type: ignore[arg-type]
+        started_at=session.started_at,
+        last_heartbeat_at=session.last_heartbeat_at or "",
+        violation_count=count,
+        max_violations=proctor_svc.MAX_PROCTOR_VIOLATIONS,
+    )
+
+
+@router.post("/assessments/{assessment_id}/session/heartbeat", response_model=ExamSessionOut)
+def exam_session_heartbeat(
+    assessment_id: str,
+    body: ExamSessionHeartbeat,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("student")),
+) -> ExamSessionOut:
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment or assessment.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    if assessment.mode == "practice":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not applicable for practice")
+    profile = _student_profile_or_400(db, user)
+    session = proctor_svc.heartbeat_for_assessment(
+        db,
+        assessment=assessment,
+        student_id=profile.id,
+        device_id=body.device_id,
+    )
+    return ExamSessionOut(
+        id=session.id,
+        assessment_id=session.assessment_id,
+        device_id=session.device_id,
+        status=session.status,  # type: ignore[arg-type]
+        started_at=session.started_at,
+        last_heartbeat_at=session.last_heartbeat_at or "",
+        violation_count=proctor_svc.violation_count(db, assessment_id, profile.id),
+        max_violations=proctor_svc.MAX_PROCTOR_VIOLATIONS,
+    )
+
+
+@router.post("/assessments/{assessment_id}/violations", response_model=ExamViolationRecordOut)
+def record_exam_violation(
+    assessment_id: str,
+    body: ExamViolationCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("student")),
+) -> ExamViolationRecordOut:
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment or assessment.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    profile = _student_profile_or_400(db, user)
+    _assert_student_assigned(assessment, profile)
+    ua, _ip = _client_meta(request)
+    count, terminated, submission = proctor_svc.record_violation(
+        db,
+        assessment=assessment,
+        profile=profile,
+        device_id=body.device_id,
+        violation_type=body.type,
+        occurred_at=body.timestamp,
+        user_agent=ua,
+    )
+    return ExamViolationRecordOut(
+        terminated=terminated,
+        violation_count=count,
+        max_violations=proctor_svc.MAX_PROCTOR_VIOLATIONS,
+        submission=_submission_out(submission) if submission else None,
+    )
+
+
+@router.get("/assessments/{assessment_id}/violations", response_model=list[ExamViolationOut])
+def list_exam_violations(
+    assessment_id: str,
+    student_id: str | None = Query(None, alias="studentId"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "tutor")),
+) -> list[ExamViolationOut]:
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment or assessment.institution_id != user.institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    rows = proctor_svc.list_violations(db, assessment_id=assessment_id, student_id=student_id)
+    return [
+        ExamViolationOut(
+            id=row.id,
+            assessment_id=row.assessment_id,
+            student_id=row.student_id,
+            violation_type=row.violation_type,
+            occurred_at=row.occurred_at,
+            session_id=row.session_id,
+        )
+        for row in rows
+    ]
 
 
 @router.post("/assessments/{assessment_id}/submit", response_model=AssessmentSubmissionOut)
@@ -672,55 +842,19 @@ def submit_assessment(
     if existing_submission(db, assessment_id, profile.id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Assessment already submitted")
 
-    qids = from_json_list(assessment.selected_question_ids)
-    questions = {q.id: q for q in db.query(Question).filter(Question.id.in_(qids)).all()}
-    score = 0
-    max_score = sum(q.marks for q in questions.values())
-    for ans in body.answers:
-        qid = dict_get(ans, "question_id", "questionId")
-        selected = dict_get(ans, "selected_option", "selectedOption", default="")
-        q = questions.get(qid)
-        if q and q.correct_answer and selected and str(selected).upper() == q.correct_answer.upper():
-            score += q.marks
+    if assessment.mode != "practice":
+        proctor_svc.assert_active_device_session(db, assessment, profile.id, body.device_id)
 
-    submitted_at = datetime.now().isoformat(timespec="minutes")
-    submission = existing_attempt(db, assessment_id, profile.id)
-    if submission is None:
-        submission = AssessmentSubmission(
-            id=f"sub-{uuid.uuid4().hex[:8]}",
-            assessment_id=assessment_id,
-            student_id=profile.id,
-            score=score,
-            max_score=max_score,
-            time_spent_min=body.time_spent_min,
-            submitted_at=submitted_at,
-            status="attended",
-            answers=json.dumps(body.answers),
-        )
-        db.add(submission)
-    else:
-        submission.score = score
-        submission.max_score = max_score
-        submission.time_spent_min = body.time_spent_min
-        submission.submitted_at = submitted_at
-        submission.status = "attended"
-        submission.answers = json.dumps(body.answers)
-        submission.remaining_seconds = 0
-    update_student_profile_after_submission(db, profile, score, max_score, submitted_at)
-    update_assessment_class_avg(db, assessment_id)
-    db.flush()
-    build_and_store_assessment_report(db, assessment_id, profile.id, commit=False)
-    db.commit()
-    return AssessmentSubmissionOut(
-        id=submission.id,
-        assessment_id=submission.assessment_id,
-        student_id=submission.student_id,
-        score=submission.score,
-        max_score=submission.max_score,
-        time_spent_min=submission.time_spent_min,
-        submitted_at=submission.submitted_at,
-        status=submission.status,  # type: ignore[arg-type]
+    submission = proctor_svc.finalize_attempt_as_attended(
+        db,
+        assessment=assessment,
+        profile=profile,
+        answers=list(body.answers),
+        time_spent_min=body.time_spent_min,
+        termination_reason=None,
+        commit=True,
     )
+    return _submission_out(submission)
 
 
 @router.get("/assessments/{assessment_id}/attendance", response_model=list[AttendanceRecordOut])

@@ -667,7 +667,6 @@ class AssessmentUpdate(CamelModel):
     title: str | None = None
     status: Literal["draft", "scheduled", "live", "completed"] | None = None
     scheduled_at: str | None = None
-    scheduled_at: str | None = None
     available_until: str | None = None
     assigned_student_ids: list[str] | None = None
 
@@ -781,6 +780,7 @@ class StudentAssessmentSummaryOut(CamelModel):
 class AssessmentSubmissionCreate(CamelModel):
     answers: list[dict]
     time_spent_min: int = 0
+    device_id: str | None = None
 
 
 class AssessmentAttemptAnswer(CamelModel):
@@ -793,6 +793,7 @@ class AssessmentAttemptSave(CamelModel):
     current_index: int = 0
     flagged_ids: list[str] = Field(default_factory=list)
     remaining_seconds: int | None = None
+    device_id: str | None = None
 
 
 class AssessmentAttemptOut(CamelModel):
@@ -812,6 +813,49 @@ class AssessmentSubmissionOut(CamelModel):
     time_spent_min: int
     submitted_at: str
     status: Literal["attended", "absent", "pending", "in_progress"]
+    termination_reason: str | None = None
+
+
+class ExamSessionClaim(CamelModel):
+    device_id: str
+
+
+class ExamSessionHeartbeat(CamelModel):
+    device_id: str
+    last_activity_at: str | None = None
+
+
+class ExamSessionOut(CamelModel):
+    id: str
+    assessment_id: str
+    device_id: str
+    status: Literal["active", "ended", "terminated"]
+    started_at: str
+    last_heartbeat_at: str
+    violation_count: int = 0
+    max_violations: int = 3
+
+
+class ExamViolationCreate(CamelModel):
+    type: str
+    device_id: str
+    timestamp: str | None = None
+
+
+class ExamViolationOut(CamelModel):
+    id: str
+    assessment_id: str
+    student_id: str
+    violation_type: str
+    occurred_at: str
+    session_id: str
+
+
+class ExamViolationRecordOut(CamelModel):
+    terminated: bool
+    violation_count: int
+    max_violations: int
+    submission: AssessmentSubmissionOut | None = None
 
 
 class AttendanceRecordOut(CamelModel):
