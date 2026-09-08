@@ -270,6 +270,7 @@ def _student_master_out(db: Session, profile: StudentProfile) -> StudentMasterOu
         batch_ids=data["batchIds"],
         center_id=data["centerId"],
         academic_year=data["academicYear"],
+        current_enrollment_id=data.get("currentEnrollmentId"),
         school_name=data["schoolName"],
         email=data["email"],
         status=data["status"],  # type: ignore[arg-type]
@@ -342,7 +343,7 @@ def get_curriculum(
 def add_board(
     body: AddBoardRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor", "admin")),
+    user: User = Depends(require_roles("admin")),
 ) -> CurriculumBoardOut:
     name = body.name.strip()
     if not name:
@@ -375,7 +376,7 @@ def add_board(
 def add_grade(
     body: AddGradeRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor", "admin")),
+    user: User = Depends(require_roles("admin")),
 ) -> dict[str, str]:
     board = (
         db.query(Board)
@@ -441,7 +442,53 @@ def add_topic(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> dict[str, str]:
-    _find_or_create_topic(db, user.institution_id, body.board, body.grade, body.subject, body.topic)
+    topic_name = body.topic.strip()
+    if not topic_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Topic name is required")
+    # Board/grade must already exist (admin-managed). Subject may be created by tutors.
+    board = _get_board(db, user.institution_id, body.board)
+    grade = _get_grade(db, board, body.grade)
+    subject_name = body.subject.strip()
+    if not subject_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Subject name is required")
+    subject = (
+        db.query(Subject).filter(Subject.grade_id == grade.id, Subject.name == subject_name).first()
+    )
+    if not subject:
+        subject = Subject(
+            id=_unique_subject_id(db, grade.id, subject_name),
+            grade_id=grade.id,
+            name=subject_name,
+        )
+        db.add(subject)
+        db.flush()
+    chapter_label = subject.name
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.subject_id == subject.id, Chapter.name == chapter_label)
+        .first()
+    )
+    if not chapter:
+        chapter = Chapter(
+            id=_compact_row_id(db, Chapter, "ch", subject.id, chapter_label),
+            subject_id=subject.id,
+            name=chapter_label,
+            order=db.query(Chapter).filter(Chapter.subject_id == subject.id).count() + 1,
+        )
+        db.add(chapter)
+        db.flush()
+    existing = (
+        db.query(Topic).filter(Topic.chapter_id == chapter.id, Topic.name == topic_name).first()
+    )
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Topic already exists")
+    db.add(
+        Topic(
+            id=_compact_row_id(db, Topic, "top", chapter.id, topic_name),
+            chapter_id=chapter.id,
+            name=topic_name,
+        )
+    )
     db.commit()
     return {"status": "created"}
 
@@ -450,7 +497,7 @@ def add_topic(
 def update_board(
     body: UpdateBoardRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor", "admin")),
+    user: User = Depends(require_roles("admin")),
 ) -> dict[str, str]:
     board = _get_board(db, user.institution_id, body.board)
     new_name = body.new_name.strip()
@@ -482,7 +529,7 @@ def update_board(
 def delete_board(
     board: str = Query(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor", "admin")),
+    user: User = Depends(require_roles("admin")),
 ) -> None:
     board_row = _get_board(db, user.institution_id, board)
     db.delete(board_row)
@@ -493,7 +540,7 @@ def delete_board(
 def update_grade(
     body: UpdateGradeRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor", "admin")),
+    user: User = Depends(require_roles("admin")),
 ) -> dict[str, str]:
     board = _get_board(db, user.institution_id, body.board)
     grade = _get_grade(db, board, body.grade)
@@ -526,7 +573,7 @@ def delete_grade(
     board: str = Query(...),
     grade: str = Query(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles("tutor", "admin")),
+    user: User = Depends(require_roles("admin")),
 ) -> None:
     board_row = _get_board(db, user.institution_id, board)
     grade_row = _get_grade(db, board_row, grade)
@@ -690,13 +737,25 @@ def list_students(
     batch: str | None = Query(None),
     center: str | None = Query(None),
     search: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     page: int | None = Query(None, ge=1),
     limit: int | None = Query(None, ge=1, le=200),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "tutor")),
     payload: dict = Depends(get_token_payload),
 ) -> PaginatedOut[StudentSummaryOut] | list[StudentSummaryOut]:
+    from app.services import enrollments as enr_svc
+
     role = get_effective_role(payload, user)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
+    year_id = year.id if year else None
     q = student_master_base_query(db, user.institution_id)
     q = apply_branch_scope_to_students(q, db, user, role, center)
     q = apply_student_master_filters(
@@ -706,6 +765,7 @@ def list_students(
         board=board,
         grade=grade,
         batch=batch,
+        academic_year_id=year_id,
         institution_id=user.institution_id,
         db=db,
     )
@@ -725,23 +785,38 @@ def list_students(
 @router.get("/students/master/stats", response_model=StudentMasterStatsOut)
 def list_students_master_stats(
     center: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "tutor")),
     payload: dict = Depends(get_token_payload),
 ) -> StudentMasterStatsOut:
+    from app.services import enrollments as enr_svc
+
     role = get_effective_role(payload, user)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
+    year_id = year.id if year else None
     if center:
         assert_can_access_center(db, user, role, center)
-        stats = student_master_stats(db, user.institution_id, center=center)
-    else:
-        q = apply_branch_scope_to_students(
-            student_master_base_query(db, user.institution_id), db, user, role, None
-        )
-        profiles = q.all()
-        total = len(profiles)
-        active = sum(1 for p in profiles if p.status == "active")
-        stats = {"total": total, "active": active, "inactive": total - active}
-    return StudentMasterStatsOut(**stats)
+    # Always respect branch hierarchy (owner/all-branches vs assigned centers).
+    q = student_master_base_query(db, user.institution_id)
+    q = apply_branch_scope_to_students(q, db, user, role, center)
+    q = apply_student_master_filters(
+        q,
+        center=center,
+        academic_year_id=year_id,
+        institution_id=user.institution_id,
+        db=db,
+    )
+    total = q.count()
+    active = q.filter(StudentProfile.status == "active").count()
+    return StudentMasterStatsOut(total=total, active=active, inactive=total - active)
 
 
 @router.get("/students/master", response_model=PaginatedOut[StudentMasterOut])
@@ -754,11 +829,23 @@ def list_students_master(
     board: str | None = Query(None),
     grade: str | None = Query(None),
     batch: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "tutor")),
     payload: dict = Depends(get_token_payload),
 ) -> PaginatedOut[StudentMasterOut]:
+    from app.services import enrollments as enr_svc
+
     role = get_effective_role(payload, user)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
+    year_id = year.id if year else None
     q = student_master_base_query(db, user.institution_id)
     q = apply_branch_scope_to_students(q, db, user, role, center)
     q = apply_student_master_filters(
@@ -769,6 +856,7 @@ def list_students_master(
         board=board,
         grade=grade,
         batch=batch,
+        academic_year_id=year_id,
         institution_id=user.institution_id,
         db=db,
     )
@@ -849,6 +937,7 @@ def create_student(
     )
     db.add_all([new_user, profile])
     db.flush()
+    batch_row = None
     if body.batch_id:
         batch_row = _get_batch(db, body.batch_id, user.institution_id)
         _assign_student_to_batch_row(db, batch_row, sid)
@@ -863,6 +952,29 @@ def create_student(
         )
         if batch_row:
             _assign_student_to_batch_row(db, batch_row, sid)
+    from app.services import enrollments as enr_svc
+
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=body.academic_year_id,
+        academic_year=body.academic_year,
+    )
+    if not year:
+        year = enr_svc.ensure_academic_year(
+            db, user.institution_id, body.academic_year or "2025-26", make_current=True
+        )
+    enr_svc.create_enrollment(
+        db,
+        student_id=sid,
+        academic_year_id=year.id,
+        board=body.board,
+        grade=body.grade,
+        batch_id=batch_row.id if batch_row else None,
+        center_id=center_id,
+        enrollment_status="active",
+        set_as_current=True,
+    )
     db.commit()
     from app.services.centers import sync_center_counts
 
@@ -953,6 +1065,7 @@ def _batch_out(db: Session, batch: Batch) -> TutorBatchOut:
         schedule_timing=batch.schedule_timing,
         student_ids=student_ids,
         avg_score=batch.avg_score,
+        academic_year_id=batch.academic_year_id,
     )
 
 
@@ -960,10 +1073,23 @@ def _batch_out(db: Session, batch: Batch) -> TutorBatchOut:
 def list_batches(
     board: str | None = Query(None),
     grade: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[TutorBatchOut]:
+    from app.services import enrollments as enr_svc
+
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
     q = db.query(Batch).filter(Batch.institution_id == user.institution_id)
+    if year:
+        q = q.filter(Batch.academic_year_id == year.id)
     if board:
         q = q.filter(Batch.board == board)
     if grade:
@@ -1013,23 +1139,33 @@ def create_batch(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> TutorBatchOut:
+    from app.services import enrollments as enr_svc
+
     name = body.name.strip()
-    if (
-        db.query(Batch)
-        .filter(
-            Batch.institution_id == user.institution_id,
-            Batch.board == body.board,
-            Batch.grade == body.grade,
-            Batch.name == name,
-        )
-        .first()
-    ):
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=body.academic_year_id,
+        academic_year=body.academic_year,
+    )
+    if not year:
+        year = enr_svc.ensure_academic_year(db, user.institution_id, "2025-26", make_current=True)
+    existing_q = db.query(Batch).filter(
+        Batch.institution_id == user.institution_id,
+        Batch.board == body.board,
+        Batch.grade == body.grade,
+        Batch.name == name,
+    )
+    if year:
+        existing_q = existing_q.filter(Batch.academic_year_id == year.id)
+    if existing_q.first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Batch already exists for this board and grade")
     batch_id = _unique_batch_id(db, name)
     schedule_timing = body.schedule_timing.strip() if body.schedule_timing else None
     batch = Batch(
         id=batch_id,
         institution_id=user.institution_id,
+        academic_year_id=year.id if year else None,
         name=name,
         board=body.board,
         grade=body.grade,

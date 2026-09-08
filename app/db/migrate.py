@@ -91,6 +91,28 @@ def ensure_assessment_shuffle_questions(engine: Engine, schema: str | None = Non
         )
 
 
+def ensure_assessment_created_at(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("assessments", schema=schema_kw):
+        return
+    columns = {c["name"] for c in inspector.get_columns("assessments", schema=schema_kw)}
+    if "created_at" in columns:
+        return
+    table = f"{schema}.assessments" if schema_kw else "assessments"
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"ALTER TABLE {table} ADD COLUMN created_at VARCHAR(32) NOT NULL DEFAULT ''")
+        )
+        # Best-effort backfill so existing rows sort near their schedule time
+        conn.execute(
+            text(
+                f"UPDATE {table} SET created_at = scheduled_at "
+                "WHERE (created_at IS NULL OR created_at = '') AND scheduled_at != ''"
+            )
+        )
+
+
 def ensure_assessment_attempt_progress(engine: Engine, schema: str | None = None) -> None:
     inspector = inspect(engine)
     schema_kw = schema if schema and schema != "public" else None
@@ -450,13 +472,589 @@ def ensure_exam_violations(engine: Engine, schema: str | None = None) -> None:
         )
 
 
+def ensure_student_overall_reports(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("student_overall_reports", schema=schema_kw):
+        return
+    students_ref = f"{schema}.student_profiles(id)" if schema_kw else "student_profiles(id)"
+    table = f"{schema}.student_overall_reports" if schema_kw else "student_overall_reports"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    student_id VARCHAR(32) PRIMARY KEY REFERENCES {students_ref},
+                    summary TEXT NOT NULL DEFAULT '',
+                    summary_ta TEXT NOT NULL DEFAULT '',
+                    summary_source VARCHAR(16) NOT NULL DEFAULT 'rule-based',
+                    computed_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+
+
+def _inst_ref(engine: Engine) -> str:
+    if engine.dialect.name == "postgresql":
+        return "public.institutions(id)"
+    return "institutions(id)"
+
+
+def ensure_academic_years(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    table = f"{schema}.academic_years" if schema_kw else "academic_years"
+    if inspector.has_table("academic_years", schema=schema_kw):
+        return
+    bool_default = _bool_default(engine, sqlite_value="0")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    institution_id VARCHAR(32) NOT NULL REFERENCES {_inst_ref(engine)},
+                    name VARCHAR(16) NOT NULL,
+                    start_date VARCHAR(32) NOT NULL DEFAULT '',
+                    end_date VARCHAR(32) NOT NULL DEFAULT '',
+                    is_current BOOLEAN NOT NULL DEFAULT {bool_default},
+                    UNIQUE (institution_id, name)
+                )
+                """
+            )
+        )
+
+
+def ensure_student_enrollments(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("student_enrollments", schema=schema_kw):
+        return
+    prefix = f"{schema}." if schema_kw else ""
+    table = f"{prefix}student_enrollments"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    student_id VARCHAR(32) NOT NULL REFERENCES {prefix}student_profiles(id),
+                    academic_year_id VARCHAR(32) NOT NULL REFERENCES {prefix}academic_years(id),
+                    board VARCHAR(64) NOT NULL,
+                    grade VARCHAR(64) NOT NULL,
+                    batch_id VARCHAR(32) REFERENCES {prefix}batches(id),
+                    center_id VARCHAR(32) REFERENCES {prefix}centers(id),
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    enrolled_at VARCHAR(32) NOT NULL DEFAULT '',
+                    completed_at VARCHAR(32),
+                    UNIQUE (student_id, academic_year_id)
+                )
+                """
+            )
+        )
+
+
+def ensure_staff_assignments(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("staff_assignments", schema=schema_kw):
+        return
+    prefix = f"{schema}." if schema_kw else ""
+    table = f"{prefix}staff_assignments"
+    inst_fk = "public.institutions(id)" if engine.dialect.name == "postgresql" else f"{prefix}institutions(id)"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    staff_id VARCHAR(32) NOT NULL REFERENCES {prefix}users(id),
+                    institution_id VARCHAR(32) NOT NULL REFERENCES {inst_fk},
+                    academic_year_id VARCHAR(32) NOT NULL REFERENCES {prefix}academic_years(id),
+                    center_id VARCHAR(32) NOT NULL REFERENCES {prefix}centers(id),
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    start_date VARCHAR(32) NOT NULL DEFAULT '',
+                    end_date VARCHAR(32),
+                    UNIQUE (staff_id, academic_year_id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_staff_assignments_staff_id ON {table} (staff_id)"
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_staff_assignments_year_id ON {table} (academic_year_id)"
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_staff_assignments_center_id ON {table} (center_id)"
+            )
+        )
+
+
+def backfill_staff_assignments(engine: Engine, schema: str | None = None) -> None:
+    """Create current-year staff_assignments from user_center_access (idempotent)."""
+    import uuid
+    from datetime import date
+
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("staff_assignments", schema=schema_kw):
+        return
+    if not inspector.has_table("academic_years", schema=schema_kw):
+        return
+    if not inspector.has_table("user_center_access", schema=schema_kw):
+        return
+    if not inspector.has_table("users", schema=schema_kw):
+        return
+
+    prefix = f"{schema}." if schema_kw else ""
+    today = date.today().isoformat()
+
+    def nid() -> str:
+        return f"sas-{uuid.uuid4().hex[:10]}"
+
+    with engine.begin() as conn:
+        years = conn.execute(
+            text(
+                f"""
+                SELECT id, institution_id FROM {prefix}academic_years
+                WHERE is_current = true
+                """
+            )
+        ).fetchall()
+        # Fallback: latest year name per institution if none marked current
+        if not years:
+            years = conn.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT ON (institution_id) id, institution_id
+                    FROM {prefix}academic_years
+                    ORDER BY institution_id, name DESC
+                    """
+                )
+            ).fetchall() if engine.dialect.name == "postgresql" else []
+            if not years:
+                # SQLite: pick max name per institution
+                inst_ids = [
+                    r[0]
+                    for r in conn.execute(
+                        text(f"SELECT DISTINCT institution_id FROM {prefix}academic_years")
+                    ).fetchall()
+                ]
+                years = []
+                for inst_id in inst_ids:
+                    row = conn.execute(
+                        text(
+                            f"""
+                            SELECT id, institution_id FROM {prefix}academic_years
+                            WHERE institution_id = :iid
+                            ORDER BY name DESC
+                            LIMIT 1
+                            """
+                        ),
+                        {"iid": inst_id},
+                    ).fetchone()
+                    if row:
+                        years.append(row)
+
+        year_by_inst = {r[1]: r[0] for r in years}
+        if not year_by_inst:
+            return
+
+        # Staff = users with admin or tutor in role/roles
+        staff_rows = conn.execute(
+            text(
+                f"""
+                SELECT id, institution_id, role, roles
+                FROM {prefix}users
+                WHERE role IN ('admin', 'tutor')
+                   OR (roles IS NOT NULL AND (
+                        roles LIKE '%admin%' OR roles LIKE '%tutor%'
+                   ))
+                """
+            )
+        ).fetchall()
+
+        for staff_id, institution_id, _role, _roles in staff_rows:
+            year_id = year_by_inst.get(institution_id)
+            if not year_id:
+                continue
+            exists = conn.execute(
+                text(
+                    f"""
+                    SELECT 1 FROM {prefix}staff_assignments
+                    WHERE staff_id = :sid AND academic_year_id = :yid
+                    LIMIT 1
+                    """
+                ),
+                {"sid": staff_id, "yid": year_id},
+            ).fetchone()
+            if exists:
+                continue
+            center = conn.execute(
+                text(
+                    f"""
+                    SELECT center_id FROM {prefix}user_center_access
+                    WHERE user_id = :uid
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT 1
+                    """
+                ),
+                {"uid": staff_id},
+            ).fetchone()
+            if not center:
+                continue
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO {prefix}staff_assignments
+                    (id, staff_id, institution_id, academic_year_id, center_id, status, start_date, end_date)
+                    VALUES (:id, :sid, :iid, :yid, :cid, 'active', :start, NULL)
+                    """
+                ),
+                {
+                    "id": nid(),
+                    "sid": staff_id,
+                    "iid": institution_id,
+                    "yid": year_id,
+                    "cid": center[0],
+                    "start": today,
+                },
+            )
+
+
+def ensure_enrollment_year_columns(engine: Engine, schema: str | None = None) -> None:
+    """Add academic_year_id / enrollment_id / current_enrollment_id columns."""
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    prefix = f"{schema}." if schema_kw else ""
+
+    def _cols(table: str) -> set[str]:
+        if not inspector.has_table(table, schema=schema_kw):
+            return set()
+        return {c["name"] for c in inspector.get_columns(table, schema=schema_kw)}
+
+    with engine.begin() as conn:
+        if "academic_year_id" not in _cols("batches") and inspector.has_table("batches", schema=schema_kw):
+            conn.execute(
+                text(f"ALTER TABLE {prefix}batches ADD COLUMN academic_year_id VARCHAR(32)")
+            )
+        if "academic_year_id" not in _cols("assessments") and inspector.has_table(
+            "assessments", schema=schema_kw
+        ):
+            conn.execute(
+                text(f"ALTER TABLE {prefix}assessments ADD COLUMN academic_year_id VARCHAR(32)")
+            )
+        if "enrollment_id" not in _cols("assessment_submissions") and inspector.has_table(
+            "assessment_submissions", schema=schema_kw
+        ):
+            conn.execute(
+                text(f"ALTER TABLE {prefix}assessment_submissions ADD COLUMN enrollment_id VARCHAR(32)")
+            )
+        if "current_enrollment_id" not in _cols("student_profiles") and inspector.has_table(
+            "student_profiles", schema=schema_kw
+        ):
+            conn.execute(
+                text(
+                    f"ALTER TABLE {prefix}student_profiles ADD COLUMN current_enrollment_id VARCHAR(32)"
+                )
+            )
+
+
+def backfill_academic_enrollments(engine: Engine, schema: str | None = None) -> None:
+    """Create years + enrollments from existing student_profiles / batches / assessments."""
+    import uuid
+    from datetime import datetime, timezone
+
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("academic_years", schema=schema_kw):
+        return
+    if not inspector.has_table("student_profiles", schema=schema_kw):
+        return
+
+    prefix = f"{schema}." if schema_kw else ""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def nid(pfx: str) -> str:
+        return f"{pfx}-{uuid.uuid4().hex[:10]}"
+
+    with engine.begin() as conn:
+        # Institution IDs from users joined to profiles
+        inst_rows = conn.execute(
+            text(
+                f"""
+                SELECT DISTINCT u.institution_id
+                FROM {prefix}users u
+                INNER JOIN {prefix}student_profiles sp ON sp.user_id = u.id
+                """
+            )
+        ).fetchall()
+        # Also institutions that have batches/centers even without students
+        extra = conn.execute(
+            text(f"SELECT DISTINCT institution_id FROM {prefix}batches")
+        ).fetchall() if inspector.has_table("batches", schema=schema_kw) else []
+        institution_ids = {r[0] for r in inst_rows} | {r[0] for r in extra}
+        if not institution_ids and inspector.has_table("centers", schema=schema_kw):
+            institution_ids = {
+                r[0]
+                for r in conn.execute(text(f"SELECT DISTINCT institution_id FROM {prefix}centers")).fetchall()
+            }
+
+        for institution_id in institution_ids:
+            # Collect year names from profiles
+            year_names = [
+                r[0]
+                for r in conn.execute(
+                    text(
+                        f"""
+                        SELECT DISTINCT sp.academic_year
+                        FROM {prefix}student_profiles sp
+                        INNER JOIN {prefix}users u ON u.id = sp.user_id
+                        WHERE u.institution_id = :iid AND sp.academic_year IS NOT NULL AND sp.academic_year != ''
+                        """
+                    ),
+                    {"iid": institution_id},
+                ).fetchall()
+            ]
+            if not year_names:
+                year_names = ["2025-26"]
+
+            existing_years = {
+                r[0]: r[1]
+                for r in conn.execute(
+                    text(
+                        f"SELECT name, id FROM {prefix}academic_years WHERE institution_id = :iid"
+                    ),
+                    {"iid": institution_id},
+                ).fetchall()
+            }
+            year_id_by_name: dict[str, str] = dict(existing_years)
+            for name in sorted(set(year_names)):
+                if name not in year_id_by_name:
+                    yid = nid("ay")
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO {prefix}academic_years
+                            (id, institution_id, name, start_date, end_date, is_current)
+                            VALUES (:id, :iid, :name, '', '', :cur)
+                            """
+                        ),
+                        {
+                            "id": yid,
+                            "iid": institution_id,
+                            "name": name,
+                            "cur": False,
+                        },
+                    )
+                    year_id_by_name[name] = yid
+
+            # Ensure one current year
+            current = conn.execute(
+                text(
+                    f"""
+                    SELECT id FROM {prefix}academic_years
+                    WHERE institution_id = :iid AND is_current = {_bool_default(engine, sqlite_value='1')}
+                    LIMIT 1
+                    """
+                ),
+                {"iid": institution_id},
+            ).fetchone()
+            if not current:
+                # Prefer lexicographically latest name
+                best_name = sorted(year_id_by_name.keys())[-1]
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE {prefix}academic_years SET is_current = {_bool_default(engine, sqlite_value='1')}
+                        WHERE id = :id
+                        """
+                    ),
+                    {"id": year_id_by_name[best_name]},
+                )
+                current_year_id = year_id_by_name[best_name]
+            else:
+                current_year_id = current[0]
+
+            # Stamp batches missing academic_year_id
+            if inspector.has_table("batches", schema=schema_kw):
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE {prefix}batches
+                        SET academic_year_id = :yid
+                        WHERE institution_id = :iid
+                          AND (academic_year_id IS NULL OR academic_year_id = '')
+                        """
+                    ),
+                    {"yid": current_year_id, "iid": institution_id},
+                )
+
+            # Stamp assessments
+            if inspector.has_table("assessments", schema=schema_kw):
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE {prefix}assessments
+                        SET academic_year_id = :yid
+                        WHERE institution_id = :iid
+                          AND (academic_year_id IS NULL OR academic_year_id = '')
+                        """
+                    ),
+                    {"yid": current_year_id, "iid": institution_id},
+                )
+
+            # Create enrollments for profiles missing current_enrollment_id
+            profiles = conn.execute(
+                text(
+                    f"""
+                    SELECT sp.id, sp.board, sp.grade, sp.center_id, sp.academic_year, sp.status,
+                           sp.current_enrollment_id
+                    FROM {prefix}student_profiles sp
+                    INNER JOIN {prefix}users u ON u.id = sp.user_id
+                    WHERE u.institution_id = :iid
+                    """
+                ),
+                {"iid": institution_id},
+            ).fetchall()
+
+            for row in profiles:
+                (
+                    student_id,
+                    board,
+                    grade,
+                    center_id,
+                    academic_year_name,
+                    profile_status,
+                    current_enrollment_id,
+                ) = row
+                if current_enrollment_id:
+                    continue
+                yname = academic_year_name or "2025-26"
+                yid = year_id_by_name.get(yname) or current_year_id
+                # Resolve batch_id from batch_students
+                batch_id = None
+                if inspector.has_table("batch_students", schema=schema_kw):
+                    brow = conn.execute(
+                        text(
+                            f"""
+                            SELECT bs.batch_id FROM {prefix}batch_students bs
+                            INNER JOIN {prefix}batches b ON b.id = bs.batch_id
+                            WHERE bs.student_id = :sid AND b.institution_id = :iid
+                            LIMIT 1
+                            """
+                        ),
+                        {"sid": student_id, "iid": institution_id},
+                    ).fetchone()
+                    if brow:
+                        batch_id = brow[0]
+                enr_status = "active" if (profile_status or "active") == "active" else "inactive"
+                # Skip if enrollment already exists for year
+                exists = conn.execute(
+                    text(
+                        f"""
+                        SELECT id FROM {prefix}student_enrollments
+                        WHERE student_id = :sid AND academic_year_id = :yid
+                        """
+                    ),
+                    {"sid": student_id, "yid": yid},
+                ).fetchone()
+                if exists:
+                    enr_id = exists[0]
+                else:
+                    enr_id = nid("enr")
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO {prefix}student_enrollments
+                            (id, student_id, academic_year_id, board, grade, batch_id, center_id,
+                             status, enrolled_at, completed_at)
+                            VALUES (:id, :sid, :yid, :board, :grade, :batch_id, :center_id,
+                                    :status, :enrolled_at, NULL)
+                            """
+                        ),
+                        {
+                            "id": enr_id,
+                            "sid": student_id,
+                            "yid": yid,
+                            "board": board or "",
+                            "grade": grade or "",
+                            "batch_id": batch_id,
+                            "center_id": center_id or None,
+                            "status": enr_status,
+                            "enrolled_at": now,
+                        },
+                    )
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE {prefix}student_profiles
+                        SET current_enrollment_id = :enr
+                        WHERE id = :sid
+                        """
+                    ),
+                    {"enr": enr_id, "sid": student_id},
+                )
+
+            # Backfill submission enrollment_id
+            if inspector.has_table("assessment_submissions", schema=schema_kw):
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE {prefix}assessment_submissions
+                        SET enrollment_id = (
+                            SELECT sp.current_enrollment_id
+                            FROM {prefix}student_profiles sp
+                            WHERE sp.id = {prefix}assessment_submissions.student_id
+                        )
+                        WHERE enrollment_id IS NULL
+                        """
+                    )
+                )
+
+
+def ensure_question_image_columns(engine: Engine, schema: str | None = None) -> None:
+    """Add stem/option image key columns on questions."""
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("questions", schema=schema_kw):
+        return
+    columns = {c["name"] for c in inspector.get_columns("questions", schema=schema_kw)}
+    table = f"{schema}.questions" if schema_kw else "questions"
+    additions = [
+        "text_image_key",
+        "option_a_image_key",
+        "option_b_image_key",
+        "option_c_image_key",
+        "option_d_image_key",
+    ]
+    with engine.begin() as conn:
+        for col in additions:
+            if col not in columns:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} VARCHAR(255)"))
+
+
 def run_migrations(engine: Engine) -> None:
     ensure_batch_schedule_timing(engine)
     ensure_assessment_student_reports(engine)
+    ensure_student_overall_reports(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_student_overall_reports)
     ensure_assessment_available_until(engine)
     ensure_assessment_shuffle_questions(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_assessment_shuffle_questions)
+    ensure_assessment_created_at(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_assessment_created_at)
     ensure_assessment_attempt_progress(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_assessment_attempt_progress)
@@ -486,4 +1084,24 @@ def run_migrations(engine: Engine) -> None:
     ensure_syllabus_books(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_syllabus_books)
+
+    # Academic years + enrollments
+    ensure_academic_years(engine)
+    ensure_enrollment_year_columns(engine)
+    ensure_student_enrollments(engine)
+    backfill_academic_enrollments(engine)
+    ensure_staff_assignments(engine)
+    backfill_staff_assignments(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_academic_years)
+        patch_all_tenant_schemas(engine, ensure_enrollment_year_columns)
+        patch_all_tenant_schemas(engine, ensure_student_enrollments)
+        patch_all_tenant_schemas(engine, backfill_academic_enrollments)
+        patch_all_tenant_schemas(engine, ensure_staff_assignments)
+        patch_all_tenant_schemas(engine, backfill_staff_assignments)
+
+    ensure_question_image_columns(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_question_image_columns)
+
     _ensure_institution_schema_name(engine)

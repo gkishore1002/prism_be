@@ -235,6 +235,13 @@ class StaffOut(CamelModel):
     active: bool = True
     center_ids: list[str] = []
     roles: list[str] = []
+    # Year-scoped academic placement (when list filtered by academic_year_id)
+    assignment_id: str | None = None
+    assignment_center_id: str | None = None
+    assignment_status: str | None = None
+    assignment_start_date: str | None = None
+    assignment_end_date: str | None = None
+    academic_year_id: str | None = None
 
 
 class StaffCreate(CamelModel):
@@ -245,6 +252,8 @@ class StaffCreate(CamelModel):
     is_branch_admin: bool = False
     is_tutor: bool = False
     center_ids: list[str] = Field(default_factory=list)
+    academic_year_id: str | None = None
+    assignment_center_id: str | None = None
 
 
 class StaffUpdate(CamelModel):
@@ -258,6 +267,24 @@ class StaffUpdate(CamelModel):
 
 class StaffBranchUpdate(CamelModel):
     center_ids: list[str] = Field(default_factory=list)
+
+
+class StaffAssignmentOut(CamelModel):
+    id: str
+    staff_id: str
+    academic_year_id: str
+    academic_year_name: str = ""
+    center_id: str
+    status: str
+    start_date: str = ""
+    end_date: str | None = None
+
+
+class StaffAssignmentUpsert(CamelModel):
+    center_id: str
+    status: str = "active"
+    start_date: str | None = None
+    end_date: str | None = None
 
 
 class CenterUpdate(CamelModel):
@@ -295,6 +322,7 @@ class StudentMasterOut(CamelModel):
     batch_ids: list[str] = []
     center_id: str
     academic_year: str
+    current_enrollment_id: str | None = None
     school_name: str | None = None
     email: str | None = None
     status: Literal["active", "inactive"]
@@ -317,6 +345,7 @@ class StudentCreate(CamelModel):
     batch_id: str | None = None
     center_id: str = ""
     academic_year: str = "2025-26"
+    academic_year_id: str | None = None
     phone: str | None = Field(default=None, min_length=10, max_length=15)
     password: str | None = Field(default=None, min_length=8, max_length=128)
     email: str | None = None
@@ -377,6 +406,55 @@ class StudentUpdate(CamelModel):
     batch_ids: list[str] | None = None
     center_id: str | None = None
     status: Literal["active", "inactive"] | None = None
+    academic_year: str | None = None
+
+
+class AcademicYearOut(CamelModel):
+    id: str
+    institution_id: str
+    name: str
+    start_date: str = ""
+    end_date: str = ""
+    is_current: bool = False
+
+
+class AcademicYearCreate(CamelModel):
+    name: str
+    start_date: str = ""
+    end_date: str = ""
+    is_current: bool = False
+
+
+class AcademicYearSetCurrent(CamelModel):
+    is_current: bool = True
+
+
+class StudentEnrollmentOut(CamelModel):
+    id: str
+    student_id: str
+    academic_year_id: str
+    academic_year: str
+    board: str
+    grade: str
+    batch_id: str | None = None
+    batch: str = ""
+    center_id: str | None = None
+    center_name: str = ""
+    status: str
+    enrolled_at: str = ""
+    completed_at: str | None = None
+    is_current: bool = False
+
+
+class StudentPromoteIn(CamelModel):
+    academic_year_id: str
+    board: str
+    grade: str
+    batch_id: str | None = None
+    center_id: str | None = None
+    prior_status: Literal[
+        "completed", "detained", "transferred", "dropped", "graduated", "inactive"
+    ] = "completed"
 
 
 class TutorBatchOut(CamelModel):
@@ -388,6 +466,7 @@ class TutorBatchOut(CamelModel):
     schedule_timing: str | None = None
     student_ids: list[str] = []
     avg_score: int | None = None
+    academic_year_id: str | None = None
 
 
 class TutorBatchCreate(CamelModel):
@@ -397,6 +476,8 @@ class TutorBatchCreate(CamelModel):
     subject: str | None = None
     schedule_timing: str | None = None
     student_ids: list[str] = Field(default_factory=list)
+    academic_year_id: str | None = None
+    academic_year: str | None = None
 
 
 class TutorBatchUpdate(CamelModel):
@@ -492,6 +573,16 @@ class QuestionOut(CamelModel):
     option_c: str | None = None
     option_d: str | None = None
     correct_answer: str | None = None
+    text_image_key: str | None = None
+    option_a_image_key: str | None = None
+    option_b_image_key: str | None = None
+    option_c_image_key: str | None = None
+    option_d_image_key: str | None = None
+    text_image_url: str | None = None
+    option_a_image_url: str | None = None
+    option_b_image_url: str | None = None
+    option_c_image_url: str | None = None
+    option_d_image_url: str | None = None
 
 
 class QuestionCreate(CamelModel):
@@ -500,7 +591,7 @@ class QuestionCreate(CamelModel):
     subject: str
     chapter: str
     topic: str
-    text: str
+    text: str = ""
     difficulty: Literal["easy", "medium", "hard"] = "medium"
     marks: int = 1
     question_type: Literal["mcq", "short", "long"] = "mcq"
@@ -509,6 +600,11 @@ class QuestionCreate(CamelModel):
     option_c: str | None = None
     option_d: str | None = None
     correct_answer: str | None = None
+    text_image_key: str | None = None
+    option_a_image_key: str | None = None
+    option_b_image_key: str | None = None
+    option_c_image_key: str | None = None
+    option_d_image_key: str | None = None
 
 
 class QuestionUpdate(CamelModel):
@@ -521,6 +617,16 @@ class QuestionUpdate(CamelModel):
     option_c: str | None = None
     option_d: str | None = None
     correct_answer: str | None = None
+    text_image_key: str | None = None
+    option_a_image_key: str | None = None
+    option_b_image_key: str | None = None
+    option_c_image_key: str | None = None
+    option_d_image_key: str | None = None
+
+
+class QuestionMediaOut(CamelModel):
+    key: str
+    url: str
 
 
 class QuestionPaperOut(CamelModel):
@@ -581,6 +687,21 @@ class SyllabusBookOut(CamelModel):
     topic_count: int = 0
 
 
+class SyllabusChapterIn(CamelModel):
+    title: str
+    topics: list[str] = Field(default_factory=list)
+
+
+class SyllabusOutlineUpdate(CamelModel):
+    chapters: list[SyllabusChapterIn]
+
+
+class SyllabusOutlineApprove(CamelModel):
+    """Optional edited outline; when omitted, the stored analysis is approved as-is."""
+
+    chapters: list[SyllabusChapterIn] | None = None
+
+
 class TopicMapQuestionIn(CamelModel):
     row: int
     board: str
@@ -637,6 +758,7 @@ class AssessmentOut(CamelModel):
     timing_over: bool = False
     access_request_status: Literal["pending", "approved", "rejected"] | None = None
     can_attend: bool = False
+    created_at: str = ""
 
 
 class AssessmentCreate(CamelModel):
@@ -661,6 +783,8 @@ class AssessmentCreate(CamelModel):
     paper_coverage: Literal["full", "selected_topics"] | None = None
     selected_topics: list[str] | None = None
     shuffle_questions: bool = False
+    academic_year_id: str | None = None
+    academic_year: str | None = None
 
 
 class AssessmentUpdate(CamelModel):

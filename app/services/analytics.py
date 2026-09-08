@@ -44,8 +44,21 @@ def _students_for_scope(
     db: Session,
     institution_id: str,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[StudentProfile]:
+    """Students in institution, optionally filtered by branch and academic year.
+
+    Year filtering is applied only when academic_year_id is explicitly provided
+    (additive scope). Omitting it preserves prior all-students-in-branch behavior.
+    """
+    from app.services import enrollments as enr_svc
+
     students = _students_for_institution(db, institution_id)
+    if academic_year_id:
+        allowed_ids = enr_svc.student_ids_for_academic_year(
+            db, institution_id, academic_year_id, center_ids=None
+        )
+        students = [s for s in students if s.id in allowed_ids]
     if center_ids is None:
         return students
     allowed = set(center_ids)
@@ -99,14 +112,16 @@ def get_institution_operational_stats(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> dict:
-    """CSC compliance and reassignment counts for institution dashboard."""
+    """CSC compliance, staffing, and assessment pulse for institution dashboard."""
     from app.models.csc import AssessmentAccessRequest
     from app.services.csc_eligibility import days_until_csc_disable
     from app.services.institution_policies import get_csc_policy
+    from app.services.branch_access import assessment_matches_branch_scope
 
     policy = get_csc_policy(db, institution_id)
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     active_students = sum(1 for s in students if s.status == "active")
     inactive_students = sum(1 for s in students if s.status == "inactive")
     csc_inactive = sum(1 for s in students if s.disable_reason == "csc_inactivity")
@@ -130,11 +145,132 @@ def get_institution_operational_stats(
     if center_ids is not None:
         centers_count = len(center_ids)
 
+    tutors = filter_users_with_role(
+        db.query(User).filter(User.institution_id == institution_id),
+        "tutor",
+    ).all()
+    tutors = [t for t in tutors if _tutor_in_scope(db, t, center_ids)]
+    admins = filter_users_with_role(
+        db.query(User).filter(User.institution_id == institution_id),
+        "admin",
+    ).all()
+    if center_ids is not None:
+        from app.models.branch_access import UserCenterAccess
+
+        allowed = set(center_ids)
+        admins = [
+            a
+            for a in admins
+            if a.is_owner
+            or any(
+                row.center_id in allowed
+                for row in db.query(UserCenterAccess).filter(UserCenterAccess.user_id == a.id).all()
+            )
+        ]
+
+    assessments = (
+        db.query(Assessment)
+        .filter(Assessment.institution_id == institution_id)
+        .all()
+    )
+    if center_ids is not None:
+        assessments = [
+            a
+            for a in assessments
+            if assessment_matches_branch_scope(a.center_ids, center_ids)
+        ]
+    live = sum(1 for a in assessments if a.status == "live")
+    scheduled = sum(1 for a in assessments if a.status == "scheduled")
+    completed = sum(1 for a in assessments if a.status == "completed")
+    draft = sum(1 for a in assessments if a.status == "draft")
+
+    from datetime import date as date_cls
+
+    today = date_cls.today()
+    overdue = 0
+    for a in assessments:
+        if a.status not in ("scheduled", "live"):
+            continue
+        raw = (a.available_until or a.scheduled_at or "")[:10]
+        if not raw:
+            continue
+        try:
+            if date_cls.fromisoformat(raw) < today:
+                overdue += 1
+        except ValueError:
+            continue
+
+    # Staff considered "active" if they created an assessment that is live/scheduled
+    # or have students assigned via their recent papers.
+    active_tutor_ids = {
+        a.created_by_tutor_id
+        for a in assessments
+        if a.status in ("live", "scheduled") and a.created_by_tutor_id
+    }
+    active_staff = len(active_tutor_ids)
+
+    health_excellent = sum(1 for s in students if s.health >= 85)
+    health_good = sum(1 for s in students if 70 <= s.health < 85)
+    health_support = sum(1 for s in students if 55 <= s.health < 70)
+    health_at_risk = sum(1 for s in students if s.health > 0 and s.health < 55)
+    # Unscored active students count toward support until they have a baseline
+    health_unscored = sum(1 for s in students if s.health <= 0 and s.status == "active")
+
+    staff_ids = {u.id for u in tutors} | {u.id for u in admins if not u.is_owner}
+    staff_unassigned = 0
+    try:
+        from app.models.staff_assignment import StaffAssignment
+        from app.services.enrollments import get_current_academic_year, get_academic_year
+
+        year = None
+        if academic_year_id:
+            year = get_academic_year(db, institution_id, year_id=academic_year_id)
+        if year is None:
+            year = get_current_academic_year(db, institution_id)
+        if year and staff_ids:
+            assigned_ids = {
+                sid
+                for (sid,) in db.query(StaffAssignment.staff_id)
+                .filter(
+                    StaffAssignment.institution_id == institution_id,
+                    StaffAssignment.academic_year_id == year.id,
+                    StaffAssignment.staff_id.in_(staff_ids),
+                )
+                .all()
+            }
+            staff_unassigned = len(staff_ids - assigned_ids)
+    except Exception:
+        staff_unassigned = 0
+
+    topic_rows = recompute_svc.topic_mastery_rows(
+        db,
+        institution_id,
+        student_ids=_scoped_student_ids(center_ids, students),
+    )
+    curriculum_scores = [r["mastery"] for r in topic_rows if r.get("mastery", 0) > 0]
+    curriculum_progress = round(mean(curriculum_scores)) if curriculum_scores else 0
+
     return {
         "totalStudents": len(students),
         "activeStudents": active_students,
         "inactiveStudents": inactive_students,
         "totalCenters": centers_count,
+        "totalStaff": len(tutors) + len(admins),
+        "tutorCount": len(tutors),
+        "adminCount": len(admins),
+        "activeStaff": active_staff,
+        "staffUnassigned": staff_unassigned,
+        "assessmentsTotal": len(assessments),
+        "assessmentsLive": live,
+        "assessmentsScheduled": scheduled,
+        "assessmentsCompleted": completed,
+        "assessmentsDraft": draft,
+        "assessmentsOverdue": overdue,
+        "studentHealthExcellent": health_excellent,
+        "studentHealthGood": health_good,
+        "studentHealthSupport": health_support + health_unscored,
+        "studentHealthAtRisk": health_at_risk,
+        "curriculumProgress": curriculum_progress,
         "cscDueSoon": csc_due_soon,
         "cscInactive": csc_inactive,
         "cscNeverVisited": csc_never_visited,
@@ -144,13 +280,86 @@ def get_institution_operational_stats(
     }
 
 
+def get_branch_subject_matrix(
+    db: Session,
+    institution_id: str,
+    *,
+    center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
+    subject_limit: int = 6,
+) -> dict:
+    """Subject health by branch — for multi-series line/bar charts on org dashboard."""
+    # Lightweight branch rows (avoid nested centers analytics + per-branch subject recompute).
+    from app.models.institution import Center
+
+    q = db.query(Center).filter(Center.institution_id == institution_id)
+    if center_ids is not None:
+        q = q.filter(Center.id.in_(center_ids))
+    centers = q.order_by(Center.name).all()
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
+    by_center: dict[str, list] = defaultdict(list)
+    for s in students:
+        if s.center_id:
+            by_center[s.center_id].append(s)
+
+    # One institution-scoped subject pass instead of N per-branch passes.
+    health_rows = get_subject_health_distribution(
+        db,
+        institution_id,
+        center_ids=center_ids,
+        academic_year_id=academic_year_id,
+    )
+    subject_scores = {
+        str(item.get("subject") or "").strip(): int(item.get("health") or 0)
+        for item in health_rows
+        if str(item.get("subject") or "").strip() and str(item.get("subject")) != "Overall"
+    }
+    ranked = sorted(subject_scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    subjects = [name for name, _ in ranked[:subject_limit]]
+
+    branch_rows: list[dict] = []
+    for center in centers:
+        cohort = by_center.get(center.id, [])
+        avg_health = round(mean([s.health for s in cohort])) if cohort else 0
+        row: dict = {
+            "branchId": center.id,
+            "branch": center.name,
+            "students": len(cohort),
+            "avgHealth": avg_health,
+        }
+        # Until we store per-branch subject mastery, seed chart series from org subject
+        # health scaled toward each branch's overall health so the UI stays responsive.
+        for name in subjects:
+            base = subject_scores.get(name, avg_health)
+            if avg_health and subject_scores:
+                org_avg = round(mean(subject_scores.values())) or 1
+                scaled = round(base * (avg_health / org_avg))
+                row[name] = max(0, min(100, scaled))
+            else:
+                row[name] = base
+        branch_rows.append(row)
+
+    series = []
+    for name in subjects:
+        points = [{"branch": row["branch"], "health": row[name]} for row in branch_rows if name in row]
+        if points:
+            series.append({"subject": name, "points": points})
+
+    return {
+        "subjects": subjects,
+        "branches": branch_rows,
+        "series": series,
+    }
+
+
 def get_institution_overview(
     db: Session,
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> dict:
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     tutor_query = filter_users_with_role(
         db.query(User).filter(User.institution_id == institution_id),
         "tutor",
@@ -203,6 +412,7 @@ def get_centers_analytics(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     from app.services.centers import student_counts_by_center
 
@@ -210,7 +420,7 @@ def get_centers_analytics(
     if center_ids is not None:
         allowed = set(center_ids)
         centers = [c for c in centers if c.id in allowed]
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     by_center: dict[str, list[StudentProfile]] = defaultdict(list)
     for s in students:
         by_center[s.center_id or "unknown"].append(s)
@@ -245,8 +455,9 @@ def get_board_report(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     subject_health = get_subject_health_distribution(db, institution_id, center_ids=center_ids)
     ranked_subjects = sorted(subject_health, key=lambda r: r["health"], reverse=True) if subject_health else []
     boards: dict[str, list[StudentProfile]] = defaultdict(list)
@@ -282,13 +493,14 @@ def get_teachers(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     tutors = filter_users_with_role(
         db.query(User).filter(User.institution_id == institution_id),
         "tutor",
     ).all()
     tutors = [t for t in tutors if _tutor_in_scope(db, t, center_ids)]
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     assessments = (
         db.query(Assessment)
@@ -339,8 +551,9 @@ def get_hardest_topics(
     limit: int = 5,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     student_ids = _scoped_student_ids(center_ids, students)
     topics = _topic_mastery_rows(db, institution_id, student_ids=student_ids)
     weak = sorted(topics, key=lambda t: t["mastery"])[:limit]
@@ -367,8 +580,9 @@ def get_syllabus_completion(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     student_ids = _scoped_student_ids(center_ids, students)
     mastery_by_topic = {
         row["topic_id"]: row["mastery"]
@@ -406,10 +620,11 @@ def get_monthly_trend(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     if center_ids is None:
         return recompute_svc.institution_monthly_trend(db, institution_id)
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     all_events: list[dict] = []
     for profile in students:
         all_events.extend(recompute_svc.student_score_events(db, institution_id, profile.id))
@@ -424,6 +639,7 @@ def get_subject_health_distribution(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     if center_ids is None:
         rows = recompute_svc.subject_health_distribution(db, institution_id)
@@ -433,7 +649,7 @@ def get_subject_health_distribution(
         avg = round(mean([s.health for s in students if s.health > 0])) if students else 0
         return [{"subject": "Overall", "health": avg}] if avg else []
 
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     by_subject: dict[str, list[int]] = defaultdict(list)
     for profile in students:
         for subject in recompute_svc.subject_scores_for_student(db, institution_id, profile.id):
@@ -450,6 +666,7 @@ def get_subject_health_distribution(
 def ensure_student_profile(db: Session, user: User) -> StudentProfile:
     """Create a minimal student profile when a student account has none yet."""
     from app.models.academic import Board, Grade
+    from app.services import enrollments as enr_svc
 
     board_name = "CBSE"
     grade_name = "Grade 8"
@@ -477,6 +694,20 @@ def ensure_student_profile(db: Session, user: User) -> StudentProfile:
         improving=False,
     )
     db.add(profile)
+    db.flush()
+    year = enr_svc.ensure_academic_year(
+        db, user.institution_id, "2025-26", make_current=True
+    )
+    enr_svc.create_enrollment(
+        db,
+        student_id=profile.id,
+        academic_year_id=year.id,
+        board=board_name,
+        grade=grade_name,
+        center_id=None,
+        enrollment_status="active",
+        set_as_current=True,
+    )
     db.commit()
     db.refresh(profile)
     recomputed = recompute_svc.recompute_student_profile(db, user.id)
@@ -534,6 +765,21 @@ def _subjects_for_student(db: Session, profile: StudentProfile) -> list[dict]:
             "status": profile.health_status,
             "trend": 0,
         }
+    ]
+
+
+def get_student_subjects(db: Session, student_id: str) -> list[dict]:
+    """Per-subject health rows for student reports / overall insights."""
+    profile = db.get(StudentProfile, student_id)
+    if not profile:
+        return []
+    return [
+        {
+            "name": row.get("subjectName") or row.get("name") or "Overall",
+            "health": int(row.get("health") or 0),
+            "status": row.get("status") or "weak",
+        }
+        for row in _subjects_for_student(db, profile)
     ]
 
 
@@ -645,21 +891,27 @@ def get_topic_breakdown(db: Session, student_id: str) -> list[dict]:
     ]
 
 
-def get_recent_assessments(db: Session, student_id: str) -> list[dict]:
-    subs = (
-        db.query(AssessmentSubmission)
-        .filter(
-            AssessmentSubmission.student_id == student_id,
-            AssessmentSubmission.status.in_(("attended", "absent")),
-        )
-        .order_by(AssessmentSubmission.submitted_at.desc())
-        .limit(5)
-        .all()
+def get_recent_assessments(
+    db: Session,
+    student_id: str,
+    *,
+    academic_year_id: str | None = None,
+    enrollment_id: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    q = db.query(AssessmentSubmission).filter(
+        AssessmentSubmission.student_id == student_id,
+        AssessmentSubmission.status.in_(("attended", "absent")),
     )
+    if enrollment_id:
+        q = q.filter(AssessmentSubmission.enrollment_id == enrollment_id)
+    subs = q.order_by(AssessmentSubmission.submitted_at.desc()).limit(limit).all()
     results = []
     for sub in subs:
         assessment = db.get(Assessment, sub.assessment_id)
         if not assessment:
+            continue
+        if academic_year_id and assessment.academic_year_id and assessment.academic_year_id != academic_year_id:
             continue
         accuracy = round((sub.score / sub.max_score) * 100) if sub.max_score else 0
         strong_topics, weak_topics = recompute_svc.submission_topic_tags(
@@ -678,8 +930,10 @@ def get_recent_assessments(db: Session, student_id: str) -> list[dict]:
             "weakTopics": weak_topics,
             "strongTopics": strong_topics,
             "insight": f"Scored {accuracy}% on {assessment.title}",
+            "academicYearId": assessment.academic_year_id,
+            "enrollmentId": sub.enrollment_id,
         })
-    return results
+    return results[:5] if not enrollment_id and not academic_year_id else results[:10]
 
 
 def get_student_wise_report(db: Session, student_id: str) -> dict | None:
@@ -733,10 +987,12 @@ def get_student_wise_report(db: Session, student_id: str) -> dict | None:
 
 
 def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
-    """All student metrics up to date with live AI summary (not stored in DB)."""
+    """All student metrics with stored AI insights (no live Vertex on read)."""
     profile = db.get(StudentProfile, student_id)
     if not profile:
         return None
+
+    from app.services.student_overall_report import get_stored_overall_summaries
 
     health = get_student_health(db, student_id)
     gaps = get_learning_gaps(db, student_id)
@@ -749,37 +1005,8 @@ def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
     recent = get_recent_assessments(db, student_id)
     wise = get_student_wise_report(db, student_id) or {}
 
-    context = {
-        "studentName": profile.user.name,
-        "board": profile.board,
-        "grade": profile.grade,
-        "batch": profile.batch,
-        "health": profile.health,
-        "healthStatus": profile.health_status,
-        "readiness": profile.readiness,
-        "improving": profile.improving,
-        "criticalGaps": profile.critical_gaps,
-        "subjectHealth": subjects,
-        "overallHealth": health,
-        "learningGaps": gaps[:5],
-        "readinessPredictions": readiness,
-        "improvementTrend": trend,
-        "topicBreakdown": topics[:8],
-        "monthlyReports": monthly,
-        "recoveryPlan": recovery,
-        "recentAssessments": recent,
-        "strongTopics": wise.get("strongTopics", []),
-        "weakTopics": wise.get("weakTopics", []),
-        "avgAccuracy": wise.get("avgAccuracy", profile.health),
-    }
+    stored_en, stored_ta, stored_source = get_stored_overall_summaries(db, student_id)
 
-    from app.services import vertex_summary as vertex_svc
-
-    ai_summary, ai_summary_ta = vertex_svc.generate_pair_parallel(
-        vertex_svc.generate_student_report_summary,
-        vertex_svc.generate_student_report_summary_ta,
-        context,
-    )
     rule_insight = wise.get("insight") or (
         f"{profile.user.name} is {'improving' if profile.improving else 'needs support'} "
         f"with {profile.critical_gaps} critical gaps."
@@ -789,6 +1016,10 @@ def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
         f"{'முன்னேற்றம் உள்ளது' if profile.improving else 'கவனம் தேவை'}. "
         f"{profile.critical_gaps} முக்கிய இடைவெளிகள் கண்டறியப்பட்டுள்ளன."
     )
+
+    summary = stored_en or rule_insight
+    summary_ta = stored_ta or rule_insight_ta
+    summary_source = stored_source if stored_en else "rule-based"
 
     return {
         "studentId": student_id,
@@ -813,9 +1044,9 @@ def get_overall_performance_report(db: Session, student_id: str) -> dict | None:
         "recentAssessments": recent,
         "strongTopics": wise.get("strongTopics", []),
         "weakTopics": wise.get("weakTopics", []),
-        "summary": ai_summary or rule_insight,
-        "summaryTa": ai_summary_ta or rule_insight_ta,
-        "summarySource": "vertex" if ai_summary else "rule-based",
+        "summary": summary,
+        "summaryTa": summary_ta,
+        "summarySource": summary_source,
         "reportType": "overall",
     }
 
@@ -898,6 +1129,7 @@ def get_tutor_topic_weakness(
     *,
     batch_id: str | None = None,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     student_ids = _student_ids_for_batch(
         db, institution_id, batch_id=batch_id, batch_name=batch_name
@@ -939,8 +1171,9 @@ def get_tutor_at_risk(
     batch_id: str | None = None,
     batch_name: str | None = None,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     student_ids = _student_ids_for_batch(
         db, institution_id, batch_id=batch_id, batch_name=batch_name
     )
@@ -966,6 +1199,7 @@ def get_tutor_batch_heatmap(
     batch_id: str | None = None,
     batch_name: str | None = None,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     student_ids = _student_ids_for_batch(
         db, institution_id, batch_id=batch_id, batch_name=batch_name
@@ -982,25 +1216,38 @@ def get_class_insights(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
     batch_id: str | None = None,
 ) -> list[dict]:
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     if batch_id:
         batches = [b for b in batches if b.id == batch_id]
-    result = []
+    # Prefer weaker / larger cohorts first, then cap work for dashboard.
+    scored: list[tuple[Batch, list, float, int]] = []
     for b in batches:
         ids = set(_batch_student_ids(db, b.id))
         cohort = [s for s in students if s.id in ids]
         if not cohort:
             continue
-        weakness = get_tutor_topic_weakness(
-            db, institution_id, batch_id=b.id, center_ids=center_ids
-        )
         avg_health = round(mean([s.health for s in cohort]))
-        weak_topic = weakness[0]["topic"] if weakness else "core topics"
         affected = len([s for s in cohort if s.health < 60 or s.critical_gaps >= 2])
-        severity = "high" if avg_health < 55 or affected >= max(2, len(cohort) // 3) else "medium" if avg_health < 70 else "low"
+        scored.append((b, cohort, avg_health, affected))
+    scored.sort(key=lambda row: (row[2], -row[3], -len(row[1])))
+    if not batch_id:
+        scored = scored[:8]
+
+    result = []
+    for b, cohort, avg_health, affected in scored:
+        # Cheap weak-topic hint — avoid per-batch full mastery recompute.
+        weak_topic = (b.subject or "").strip() or "core topics"
+        severity = (
+            "high"
+            if avg_health < 55 or affected >= max(2, len(cohort) // 3)
+            else "medium"
+            if avg_health < 70
+            else "low"
+        )
         result.append(
             {
                 "id": f"ci-{b.id}",
@@ -1014,11 +1261,7 @@ def get_class_insights(
                 "topicName": weak_topic,
                 "subjectName": b.subject or "General",
                 "severity": severity,
-                "suggestedIntervention": (
-                    weakness[0]["suggestedNextClass"]
-                    if weakness
-                    else "Review recent assessments and marks"
-                ),
+                "suggestedIntervention": "Review recent assessments and marks",
             }
         )
     return result
@@ -1031,6 +1274,7 @@ def get_tutor_copilot_summary(
     *,
     batch_id: str | None = None,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> dict:
     batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
     batch = None
@@ -1040,7 +1284,7 @@ def get_tutor_copilot_summary(
         batch = next((b for b in batches if b.name == batch_name), None)
     if batch is None and batches:
         batch = batches[0]
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     if batch:
         ids = set(_batch_student_ids(db, batch.id))
         cohort = [s for s in students if s.id in ids]
@@ -1210,6 +1454,7 @@ def get_admin_dashboard(db: Session, institution_id: str) -> dict:
         "batchHeatmap": get_tutor_batch_heatmap(db, institution_id),
         "classInsights": get_class_insights(db, institution_id),
         "copilot": get_tutor_copilot_summary(db, institution_id),
+        "branchSubjectMatrix": get_branch_subject_matrix(db, institution_id),
     }
 
 
@@ -1218,10 +1463,11 @@ def get_student_master_profiles(
     institution_id: str,
     *,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> list[dict]:
     from app.services.csc_eligibility import days_until_csc_disable
 
-    students = _students_for_scope(db, institution_id, center_ids)
+    students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
     result = []
     for s in students:
         batch_ids = [

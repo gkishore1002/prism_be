@@ -47,7 +47,7 @@ def list_assessments_for_student(
     query = (
         db.query(Assessment)
         .filter(Assessment.institution_id == institution_id)
-        .order_by(Assessment.scheduled_at.desc())
+        .order_by(Assessment.created_at.desc(), Assessment.scheduled_at.desc())
     )
     for assessment in query.all():
         if student_id not in from_json_list(assessment.assigned_student_ids):

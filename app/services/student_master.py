@@ -27,6 +27,8 @@ def apply_student_master_filters(
     board: str | None = None,
     grade: str | None = None,
     batch: str | None = None,
+    academic_year_id: str | None = None,
+    academic_year: str | None = None,
     institution_id: str | None = None,
     db: Session | None = None,
 ) -> Query:
@@ -40,20 +42,41 @@ def apply_student_master_filters(
                 StudentProfile.school_name.ilike(term),
             )
         )
-    if center:
-        q = q.filter(StudentProfile.center_id == center)
+    if academic_year_id or academic_year:
+        from app.models.enrollment import AcademicYear, StudentEnrollment
+
+        q = q.join(
+            StudentEnrollment, StudentEnrollment.student_id == StudentProfile.id
+        )
+        if academic_year_id:
+            q = q.filter(StudentEnrollment.academic_year_id == academic_year_id)
+        elif academic_year and institution_id:
+            q = q.join(AcademicYear, AcademicYear.id == StudentEnrollment.academic_year_id).filter(
+                AcademicYear.institution_id == institution_id,
+                AcademicYear.name == academic_year.strip(),
+            )
+        # Board/grade from enrollment for that year; center stays on profile so
+        # existing branch_access / apply_branch_scope_to_students remains authoritative.
+        if board:
+            q = q.filter(StudentEnrollment.board.ilike(board))
+        if grade:
+            q = q.filter(StudentEnrollment.grade == grade)
+        if center:
+            q = q.filter(StudentProfile.center_id == center)
+    else:
+        if center:
+            q = q.filter(StudentProfile.center_id == center)
+        if board:
+            q = q.filter(StudentProfile.board.ilike(board))
+        if grade:
+            q = q.filter(StudentProfile.grade == grade)
     if status:
         q = q.filter(StudentProfile.status == status)
-    if board:
-        q = q.filter(StudentProfile.board.ilike(board))
-    if grade:
-        q = q.filter(StudentProfile.grade == grade)
     if batch and institution_id and db:
-        batch_row = (
-            db.query(Batch)
-            .filter(Batch.institution_id == institution_id, Batch.name == batch)
-            .first()
-        )
+        batch_q = db.query(Batch).filter(Batch.institution_id == institution_id, Batch.name == batch)
+        if academic_year_id:
+            batch_q = batch_q.filter(Batch.academic_year_id == academic_year_id)
+        batch_row = batch_q.first()
         if batch_row:
             q = q.join(BatchStudent, BatchStudent.student_id == StudentProfile.id).filter(
                 BatchStudent.batch_id == batch_row.id
@@ -68,10 +91,18 @@ def student_master_stats(
     institution_id: str,
     *,
     center: str | None = None,
+    academic_year_id: str | None = None,
+    academic_year: str | None = None,
 ) -> dict:
     q = student_master_base_query(db, institution_id)
-    if center:
-        q = q.filter(StudentProfile.center_id == center)
+    q = apply_student_master_filters(
+        q,
+        center=center,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        institution_id=institution_id,
+        db=db,
+    )
     total = q.count()
     active = q.filter(StudentProfile.status == "active").count()
     return {"total": total, "active": active, "inactive": total - active}
@@ -91,6 +122,7 @@ def student_profile_to_master_dict(db: Session, profile: StudentProfile) -> dict
         "batchIds": batch_ids,
         "centerId": profile.center_id,
         "academicYear": profile.academic_year,
+        "currentEnrollmentId": profile.current_enrollment_id,
         "schoolName": profile.school_name,
         "email": profile.user.email,
         "status": profile.status,

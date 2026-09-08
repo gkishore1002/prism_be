@@ -37,11 +37,13 @@ class StudentProfile(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), unique=True)
+    # Cached mirrors of the active/current enrollment (not historical source of truth).
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
     batch: Mapped[str] = mapped_column(String(128), default="")
     center_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("centers.id"), nullable=True, index=True)
     academic_year: Mapped[str] = mapped_column(String(16), default="2025-26")
+    current_enrollment_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     school_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="active")
     disable_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)

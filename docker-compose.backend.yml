@@ -97,6 +97,7 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GOOGLE_APPLICATION_CREDENTIALS: /gcp/adc.json
+      QUESTION_MEDIA_ROOT: /data/question-media
 
     volumes:
       # Long syntax required on Windows so "C:" is not treated as a volume separator.
@@ -104,6 +105,7 @@ services:
         source: ${HOST_GCP_CREDENTIALS:-${APPDATA}/gcloud/application_default_credentials.json}
         target: /gcp/adc.json
         read_only: true
+      - prism_question_media:/data/question-media
 
     depends_on:
       postgres:
@@ -115,3 +117,4 @@ services:
 # ---------------------------------------------------------
 volumes:
   prism_postgres_data:
+  prism_question_media:

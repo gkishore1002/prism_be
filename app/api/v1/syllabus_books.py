@@ -27,6 +27,8 @@ from app.models.content import SyllabusBook
 from app.models.user import User
 from app.schemas import (
     SyllabusBookOut,
+    SyllabusOutlineApprove,
+    SyllabusOutlineUpdate,
     TopicMapItemOut,
     TopicMapRequest,
     TopicMapResponse,
@@ -197,6 +199,75 @@ def delete_syllabus_book(
         db.commit()
 
 
+def _require_analyzed_book(db: Session, book_id: str, institution_id: str) -> SyllabusBook:
+    book = db.get(SyllabusBook, book_id)
+    if not book or book.institution_id != institution_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    if book.status != "analyzed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Book has not been analyzed yet. Wait until status is Analyzed.",
+        )
+    return book
+
+
+@router.put("/syllabus-books/{book_id}/outline", response_model=SyllabusBookOut)
+def update_syllabus_book_outline(
+    book_id: str,
+    body: SyllabusOutlineUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> SyllabusBookOut:
+    """Save user-edited chapters/topics without syncing curriculum yet."""
+    book = _require_analyzed_book(db, book_id, user.institution_id)
+    if not body.chapters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Add at least one chapter before saving the outline.",
+        )
+    books_svc.save_book_outline(
+        db, book, [chapter.model_dump() for chapter in body.chapters]
+    )
+    db.commit()
+    db.refresh(book)
+    return _book_out(book, include_json=True)
+
+
+@router.post("/syllabus-books/{book_id}/approve", response_model=SyllabusBookOut)
+def approve_syllabus_book(
+    book_id: str,
+    body: SyllabusOutlineApprove = SyllabusOutlineApprove(),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> SyllabusBookOut:
+    """Approve summarized outline (optionally after edits) and sync topics to curriculum."""
+    book = _require_analyzed_book(db, book_id, user.institution_id)
+    if body.chapters is not None:
+        if not body.chapters:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Add at least one chapter before approving.",
+            )
+        outline = books_svc.save_book_outline(
+            db, book, [chapter.model_dump() for chapter in body.chapters]
+        )
+        chapters = outline["chapters"]
+    else:
+        _, _, data = _outline_counts(book.analysis_json)
+        chapters = (data or {}).get("chapters") or []
+    if not chapters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No chapters found in the book outline.",
+        )
+    books_svc.persist_outline_to_curriculum(
+        db, user.institution_id, book.board, book.grade, book.subject, chapters
+    )
+    db.commit()
+    db.refresh(book)
+    return _book_out(book, include_json=True)
+
+
 @router.post("/syllabus-books/{book_id}/import-topics", status_code=status.HTTP_200_OK)
 def import_book_topics_to_curriculum(
     book_id: str,
@@ -207,27 +278,19 @@ def import_book_topics_to_curriculum(
 
     Idempotent — topics that already exist are skipped by _find_or_create_topic.
     """
-    book = db.get(SyllabusBook, book_id)
-    if not book or book.institution_id != user.institution_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
-    if book.status != "analyzed":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Book has not been analyzed yet. Wait until status is Analyzed.",
-        )
-    _, _, data = books_svc._outline_counts(book.analysis_json)  # noqa: SLF001
+    book = _require_analyzed_book(db, book_id, user.institution_id)
+    _, _, data = _outline_counts(book.analysis_json)
     chapters = (data or {}).get("chapters") or []
     if not chapters:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No chapters found in the book outline.",
         )
-    books_svc.persist_outline_to_curriculum(
+    topics_added = books_svc.persist_outline_to_curriculum(
         db, user.institution_id, book.board, book.grade, book.subject, chapters
     )
     db.commit()
-    topic_count = sum(len(ch.get("topics") or [ch.get("title", "")]) for ch in chapters)
-    return {"status": "imported", "topicsAdded": topic_count}
+    return {"status": "imported", "topicsAdded": topics_added}
 
 
 @router.post("/syllabus-books/map-topics", response_model=TopicMapResponse)

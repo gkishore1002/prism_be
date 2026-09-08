@@ -10,6 +10,9 @@ class Assessment(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
+    academic_year_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("academic_years.id"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(255))
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
@@ -33,6 +36,7 @@ class Assessment(Base):
     paper_coverage: Mapped[str | None] = mapped_column(String(32), nullable=True)
     selected_topics: Mapped[str | None] = mapped_column(Text, nullable=True)
     shuffle_questions: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String(32), default="")
 
 
 class AssessmentSubmission(Base):
@@ -42,6 +46,9 @@ class AssessmentSubmission(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     assessment_id: Mapped[str] = mapped_column(ForeignKey("assessments.id"))
     student_id: Mapped[str] = mapped_column(ForeignKey("student_profiles.id"))
+    enrollment_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("student_enrollments.id"), nullable=True, index=True
+    )
     score: Mapped[int] = mapped_column(Integer, default=0)
     max_score: Mapped[int] = mapped_column(Integer, default=0)
     time_spent_min: Mapped[int] = mapped_column(Integer, default=0)
@@ -114,3 +121,17 @@ class AssessmentStudentReport(Base):
     student_message_ta: Mapped[str] = mapped_column(Text, default="")
     summary_source: Mapped[str] = mapped_column(String(16), default="rule-based")
     computed_at: Mapped[str] = mapped_column(String(32))
+
+
+class StudentOverallReport(Base):
+    """Persisted overall AI insights for a student — refreshed when assessments update."""
+
+    __tablename__ = "student_overall_reports"
+
+    student_id: Mapped[str] = mapped_column(
+        ForeignKey("student_profiles.id"), primary_key=True
+    )
+    summary: Mapped[str] = mapped_column(Text, default="")
+    summary_ta: Mapped[str] = mapped_column(Text, default="")
+    summary_source: Mapped[str] = mapped_column(String(16), default="rule-based")
+    computed_at: Mapped[str] = mapped_column(String(32), default="")

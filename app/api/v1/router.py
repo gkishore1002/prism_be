@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import admins, analytics, assessments, auth, csc, curriculum, exports, imports, institutions, marks, notifications, platform, portal, questions, search, setup, staff, syllabus_books, tutor_dashboard
+from app.api.v1 import admins, academic_years, analytics, assessments, auth, csc, curriculum, exports, imports, institutions, marks, notifications, platform, portal, question_media, questions, search, setup, staff, syllabus_books, tutor_dashboard
 
 api_router = APIRouter()
 api_router.include_router(setup.router)
@@ -11,9 +11,11 @@ api_router.include_router(staff.router)
 api_router.include_router(portal.router)
 api_router.include_router(search.router)
 api_router.include_router(institutions.router)
+api_router.include_router(academic_years.router)
 api_router.include_router(curriculum.router)
 api_router.include_router(csc.router)
 api_router.include_router(questions.router)
+api_router.include_router(question_media.router)
 api_router.include_router(syllabus_books.router)
 api_router.include_router(assessments.router)
 api_router.include_router(notifications.router)

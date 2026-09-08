@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime
 
@@ -20,6 +21,8 @@ from app.services.submissions import (
     update_student_profile_after_submission,
 )
 from app.utils import dict_get, from_json_list
+
+logger = logging.getLogger(__name__)
 
 MAX_PROCTOR_VIOLATIONS = 3
 TERMINATION_REASON = "EXCESSIVE_PROCTORING_VIOLATIONS"
@@ -239,7 +242,20 @@ def finalize_attempt_as_attended(
     update_student_profile_after_submission(db, profile, score, max_score, submitted_at)
     update_assessment_class_avg(db, assessment.id)
     db.flush()
-    build_and_store_assessment_report(db, assessment.id, profile.id, commit=False)
+    # Reports are best-effort — never fail the student's submit if AI/report gen breaks.
+    try:
+        build_and_store_assessment_report(
+            db, assessment.id, profile.id, commit=False, force=True, use_ai=True
+        )
+        from app.services.student_overall_report import build_and_store_overall_report
+
+        build_and_store_overall_report(db, profile.id, use_ai=True, commit=False)
+    except Exception:
+        logger.exception(
+            "post_submit_report_failed assessment=%s student=%s",
+            assessment.id,
+            profile.id,
+        )
     if commit:
         db.commit()
         db.refresh(submission)

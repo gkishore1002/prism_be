@@ -23,6 +23,7 @@ from app.schemas import (
 )
 from app.utils import from_json_list, to_json_list
 from app.services.syllabus_books import fill_blank_question_topics
+from app.services import question_media as media_svc
 
 router = APIRouter(tags=["questions", "question-papers"], route_class=CamelCaseAPIRoute)
 
@@ -38,13 +39,23 @@ def _question_out(q: Question, *, hide_answer: bool = False) -> QuestionOut:
         difficulty=q.difficulty,  # type: ignore[arg-type]
         marks=q.marks,
         question_type=q.question_type,  # type: ignore[arg-type]
-        text=q.text,
+        text=q.text or "",
         status=q.status,  # type: ignore[arg-type]
         option_a=q.option_a,
         option_b=q.option_b,
         option_c=q.option_c,
         option_d=q.option_d,
         correct_answer=None if hide_answer else q.correct_answer,
+        text_image_key=q.text_image_key,
+        option_a_image_key=q.option_a_image_key,
+        option_b_image_key=q.option_b_image_key,
+        option_c_image_key=q.option_c_image_key,
+        option_d_image_key=q.option_d_image_key,
+        text_image_url=media_svc.media_url_for_key(q.text_image_key),
+        option_a_image_url=media_svc.media_url_for_key(q.option_a_image_key),
+        option_b_image_url=media_svc.media_url_for_key(q.option_b_image_key),
+        option_c_image_url=media_svc.media_url_for_key(q.option_c_image_key),
+        option_d_image_url=media_svc.media_url_for_key(q.option_d_image_key),
     )
 
 
@@ -120,6 +131,15 @@ def _persist_question(db: Session, institution_id: str, body: QuestionCreate) ->
         body.topic,
         chapter_name=body.chapter,
     )
+    for key in (
+        body.text_image_key,
+        body.option_a_image_key,
+        body.option_b_image_key,
+        body.option_c_image_key,
+        body.option_d_image_key,
+    ):
+        if key:
+            media_svc.assert_key_owned(key, institution_id)
     qid = f"q-{uuid.uuid4().hex[:8]}"
     question = Question(
         id=qid,
@@ -130,7 +150,7 @@ def _persist_question(db: Session, institution_id: str, body: QuestionCreate) ->
         subject=body.subject,
         chapter=body.chapter,
         topic_name=body.topic,
-        text=body.text,
+        text=(body.text or "").strip() or ("(image)" if body.text_image_key else ""),
         difficulty=body.difficulty,
         marks=body.marks,
         question_type=body.question_type,
@@ -139,6 +159,11 @@ def _persist_question(db: Session, institution_id: str, body: QuestionCreate) ->
         option_c=body.option_c,
         option_d=body.option_d,
         correct_answer=body.correct_answer,
+        text_image_key=body.text_image_key,
+        option_a_image_key=body.option_a_image_key,
+        option_b_image_key=body.option_b_image_key,
+        option_c_image_key=body.option_c_image_key,
+        option_d_image_key=body.option_d_image_key,
     )
     db.add(question)
     return question
@@ -176,9 +201,16 @@ def update_question(
         ("option_c", "option_c"),
         ("option_d", "option_d"),
         ("correct_answer", "correct_answer"),
+        ("text_image_key", "text_image_key"),
+        ("option_a_image_key", "option_a_image_key"),
+        ("option_b_image_key", "option_b_image_key"),
+        ("option_c_image_key", "option_c_image_key"),
+        ("option_d_image_key", "option_d_image_key"),
     ]:
         val = getattr(body, field)
         if val is not None:
+            if field.endswith("_image_key") and val:
+                media_svc.assert_key_owned(val, user.institution_id)
             setattr(q, attr, val)
     db.commit()
     return _question_out(q)
@@ -213,6 +245,7 @@ def list_question_papers(
         q = q.filter(QuestionPaper.grade == grade)
     if subject:
         q = q.filter(QuestionPaper.subject == subject)
+    q = q.order_by(QuestionPaper.created_at.desc(), QuestionPaper.id.desc())
     if page is None and limit is None:
         return [_paper_out(p) for p in q.all()]
     items, total, page_n, limit_n, pages = paginate_query(q, page or 1, limit)
@@ -280,10 +313,11 @@ def create_question_paper_bulk(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one question is required")
 
     for idx, q_body in enumerate(body.questions, start=1):
-        if not q_body.text.strip():
+        has_stem = bool((q_body.text or "").strip() or q_body.text_image_key)
+        if not has_stem:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Question {idx}: text is required",
+                detail=f"Question {idx}: text or stem image is required",
             )
         if not q_body.chapter.strip():
             raise HTTPException(
@@ -291,10 +325,12 @@ def create_question_paper_bulk(
                 detail=f"Question {idx}: chapter is required",
             )
         if q_body.question_type == "mcq":
-            if not q_body.option_a or not q_body.option_b:
+            has_a = bool((q_body.option_a or "").strip() or q_body.option_a_image_key)
+            has_b = bool((q_body.option_b or "").strip() or q_body.option_b_image_key)
+            if not has_a or not has_b:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Question {idx}: MCQs require options A and B",
+                    detail=f"Question {idx}: MCQs require options A and B (text or image)",
                 )
             if not q_body.correct_answer:
                 raise HTTPException(

@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     vertex_book_timeout_seconds: int = 180
     vertex_topic_map_timeout_seconds: int = 90
     google_api_key: str = ""
+    question_media_root: str = "./data/question-media"
+    question_media_max_bytes: int = 5 * 1024 * 1024
 
     @field_validator("database_url", mode="before")
     @classmethod

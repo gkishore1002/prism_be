@@ -208,6 +208,7 @@ def generate_pair_parallel(
         return None, None
 
     timeout = max(1, settings.vertex_request_timeout_seconds) + 4
+    deadline = time.monotonic() + timeout
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         en_future = pool.submit(en_fn, context)
@@ -215,18 +216,45 @@ def generate_pair_parallel(
         en: str | None = None
         ta: str | None = None
         try:
-            en = en_future.result(timeout=timeout)
+            en = en_future.result(timeout=max(0.1, deadline - time.monotonic()))
         except FuturesTimeoutError:
             logger.warning("Vertex English summary timed out after %ss", timeout)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Vertex English summary failed: %s", exc)
         try:
-            ta = ta_future.result(timeout=timeout)
+            ta = ta_future.result(timeout=max(0.1, deadline - time.monotonic()))
         except FuturesTimeoutError:
             logger.warning("Vertex Tamil summary timed out after %ss", timeout)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Vertex Tamil summary failed: %s", exc)
     return en, ta
+
+
+def peek_cached_student_report_pair(context: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return cached overall-report summaries only — never calls Vertex."""
+    en = _cache_get(_cache_key("student_report", context))
+    ta = _cache_get(_cache_key("student_report_ta", context))
+    return en, ta
+
+
+def warm_student_report_summaries(context: dict[str, Any]) -> None:
+    """Fire-and-forget Vertex generation so the next overall-report load can use cache."""
+    if not settings.vertex_enabled:
+        return
+
+    def _run() -> None:
+        try:
+            generate_pair_parallel(
+                generate_student_report_summary,
+                generate_student_report_summary_ta,
+                context,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Background overall-report summary warm failed: %s", exc)
+
+    import threading
+
+    threading.Thread(target=_run, daemon=True, name="warm-overall-summary").start()
 
 
 def generate_assessment_report_summary(context: dict[str, Any]) -> str | None:

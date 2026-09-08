@@ -156,6 +156,39 @@ def prepare_book_for_llm(content: bytes, filename: str) -> tuple[bytes | None, s
     return pdf_bytes, text
 
 
+def normalize_outline_chapters(chapters: list[dict] | None) -> list[dict]:
+    """Sanitize chapter/topic outline before persistence."""
+    cleaned: list[dict] = []
+    for chapter in chapters or []:
+        if not isinstance(chapter, dict):
+            continue
+        title = str(chapter.get("title") or "").strip()
+        if not title:
+            continue
+        topics: list[str] = []
+        seen: set[str] = set()
+        for topic in chapter.get("topics") or []:
+            name = str(topic).strip()
+            key = name.lower()
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            topics.append(name)
+        cleaned.append({"title": title, "topics": topics})
+    return cleaned
+
+
+def save_book_outline(db: Session, book: SyllabusBook, chapters: list[dict]) -> dict:
+    cleaned = normalize_outline_chapters(chapters)
+    outline = {"chapters": cleaned}
+    book.analysis_json = json.dumps(outline)
+    book.status = "analyzed"
+    book.error_message = ""
+    db.add(book)
+    db.flush()
+    return outline
+
+
 def persist_outline_to_curriculum(
     db: Session,
     institution_id: str,
@@ -163,23 +196,23 @@ def persist_outline_to_curriculum(
     grade: str,
     subject: str,
     chapters: list[dict],
-) -> None:
+) -> int:
     from app.api.v1.curriculum import _find_or_create_topic
 
-    for chapter in chapters:
-        title = str(chapter.get("title") or "").strip()
-        if not title:
-            continue
+    added = 0
+    for chapter in normalize_outline_chapters(chapters):
+        title = chapter["title"]
         topics = chapter.get("topics") or []
         if not topics:
             _find_or_create_topic(db, institution_id, board, grade, subject, title, chapter_name=title)
+            added += 1
             continue
-        for topic in topics:
-            name = str(topic).strip()
-            if name:
-                _find_or_create_topic(
-                    db, institution_id, board, grade, subject, name, chapter_name=title
-                )
+        for name in topics:
+            _find_or_create_topic(
+                db, institution_id, board, grade, subject, name, chapter_name=title
+            )
+            added += 1
+    return added
 
 
 def analyze_book(db: Session, book: SyllabusBook, content: bytes, filename: str) -> None:
@@ -192,9 +225,7 @@ def analyze_book(db: Session, book: SyllabusBook, content: bytes, filename: str)
             pdf_bytes=pdf_bytes,
             pdf_text=pdf_text,
         )
-        persist_outline_to_curriculum(
-            db, book.institution_id, book.board, book.grade, book.subject, outline["chapters"]
-        )
+        # Outline is stored for user review/approval. Curriculum sync happens on approve.
         book.analysis_json = json.dumps(outline)
         book.status = "analyzed"
         book.error_message = ""

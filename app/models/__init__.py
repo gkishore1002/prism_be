@@ -5,6 +5,7 @@ from app.models.assessment import (
     AssessmentSubmission,
     ExamSession,
     ExamViolation,
+    StudentOverallReport,
 )
 from app.models.content import Batch, BatchStudent, QuestionPaper, SyllabusBook
 from app.models.institution import Center, Institution
@@ -16,6 +17,8 @@ from app.models.branch_access import UserCenterAccess
 from app.models.audit import AuditLog
 from app.models.deployment import SystemInitialization
 from app.models.super_admin import SuperAdmin
+from app.models.enrollment import AcademicYear, StudentEnrollment
+from app.models.staff_assignment import StaffAssignment
 from app.models.user import StudentProfile, User
 
 __all__ = [
@@ -39,6 +42,7 @@ __all__ = [
     "ExamSession",
     "ExamViolation",
     "AssessmentStudentReport",
+    "StudentOverallReport",
     "MarksEntry",
     "Notification",
     "TutorDashboardSetting",
@@ -47,4 +51,7 @@ __all__ = [
     "AuditLog",
     "UserCenterAccess",
     "SystemInitialization",
+    "AcademicYear",
+    "StudentEnrollment",
+    "StaffAssignment",
 ]

@@ -150,25 +150,26 @@ def _get_or_create_batch(
     *,
     board: str,
     grade: str,
+    academic_year_id: str | None = None,
 ) -> Batch:
     batch_name = batch_name.strip()
     board = board.strip()
     grade = grade.strip()
-    batch_row = (
-        db.query(Batch)
-        .filter(
-            Batch.institution_id == institution_id,
-            Batch.board == board,
-            Batch.grade == grade,
-            Batch.name == batch_name,
-        )
-        .first()
+    q = db.query(Batch).filter(
+        Batch.institution_id == institution_id,
+        Batch.board == board,
+        Batch.grade == grade,
+        Batch.name == batch_name,
     )
+    if academic_year_id:
+        q = q.filter(Batch.academic_year_id == academic_year_id)
+    batch_row = q.first()
     if batch_row:
         return batch_row
     batch_row = Batch(
         id=_unique_batch_id(db, batch_name),
         institution_id=institution_id,
+        academic_year_id=academic_year_id,
         name=batch_name,
         board=board,
         grade=grade,
@@ -186,16 +187,18 @@ def _assign_student_batch(
     *,
     board: str,
     grade: str,
-) -> None:
+    academic_year_id: str | None = None,
+) -> str | None:
     batch_name = batch_name.strip()
     if not batch_name:
-        return
+        return None
     batch_row = _get_or_create_batch(
         db,
         institution_id,
         batch_name,
         board=board,
         grade=grade,
+        academic_year_id=academic_year_id,
     )
     existing = (
         db.query(BatchStudent)
@@ -204,6 +207,7 @@ def _assign_student_batch(
     )
     if not existing:
         db.add(BatchStudent(batch_id=batch_row.id, student_id=student_id))
+    return batch_row.id
     _sync_profile_batch(db, student_id)
 
 
@@ -258,13 +262,32 @@ def _create_student_row(
     )
     db.add_all([new_user, profile])
     db.flush()
-    _assign_student_batch(
+    from app.services import enrollments as enr_svc
+
+    year_name = row.academic_year.strip() or "2025-26"
+    year = enr_svc.ensure_academic_year(db, institution_id, year_name, make_current=False)
+    # Ensure at least one current year exists
+    if not enr_svc.get_current_academic_year(db, institution_id):
+        enr_svc.set_current_academic_year(db, institution_id, year.id, commit=False)
+    batch_id = _assign_student_batch(
         db,
         institution_id,
         sid,
         row.batch,
         board=row.board,
         grade=row.grade,
+        academic_year_id=year.id,
+    )
+    enr_svc.create_enrollment(
+        db,
+        student_id=sid,
+        academic_year_id=year.id,
+        board=row.board.strip(),
+        grade=row.grade.strip(),
+        batch_id=batch_id,
+        center_id=center_id,
+        enrollment_status="active",
+        set_as_current=True,
     )
     return sid
 

@@ -11,9 +11,17 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_db, get_effective_role, get_token_payload, require_roles
 from app.core.routing import CamelCaseAPIRoute
 from app.core.security import hash_password
-from app.models.branch_access import UserCenterAccess
+from app.models.enrollment import AcademicYear
+from app.models.staff_assignment import StaffAssignment
 from app.models.user import User
-from app.schemas import StaffBranchUpdate, StaffCreate, StaffOut, StaffUpdate
+from app.schemas import (
+    StaffAssignmentOut,
+    StaffAssignmentUpsert,
+    StaffBranchUpdate,
+    StaffCreate,
+    StaffOut,
+    StaffUpdate,
+)
 from app.services.audit_log import record_audit
 from app.services.branch_access import (
     assigned_center_ids,
@@ -22,6 +30,8 @@ from app.services.branch_access import (
     require_tenant_management_access,
     set_user_center_access,
 )
+from app.services import enrollments as enr_svc
+from app.services import staff_assignments as sa_svc
 from app.services.user_credentials import resolve_user_credentials
 from app.services.user_roles import (
     add_role,
@@ -36,7 +46,13 @@ from app.services.user_roles import (
 router = APIRouter(prefix="/staff", tags=["staff"], route_class=CamelCaseAPIRoute)
 
 
-def _staff_out(db: Session, user: User) -> StaffOut:
+def _staff_out(
+    db: Session,
+    user: User,
+    *,
+    assignment: StaffAssignment | None = None,
+    academic_year_id: str | None = None,
+) -> StaffOut:
     return StaffOut(
         id=user.id,
         name=user.name,
@@ -45,6 +61,26 @@ def _staff_out(db: Session, user: User) -> StaffOut:
         active=True,
         center_ids=assigned_center_ids(db, user.id),
         roles=parse_roles(user),
+        assignment_id=assignment.id if assignment else None,
+        assignment_center_id=assignment.center_id if assignment else None,
+        assignment_status=assignment.status if assignment else None,
+        assignment_start_date=assignment.start_date if assignment else None,
+        assignment_end_date=assignment.end_date if assignment else None,
+        academic_year_id=assignment.academic_year_id if assignment else academic_year_id,
+    )
+
+
+def _assignment_out(db: Session, row: StaffAssignment) -> StaffAssignmentOut:
+    year = db.get(AcademicYear, row.academic_year_id)
+    return StaffAssignmentOut(
+        id=row.id,
+        staff_id=row.staff_id,
+        academic_year_id=row.academic_year_id,
+        academic_year_name=year.name if year else "",
+        center_id=row.center_id,
+        status=row.status,
+        start_date=row.start_date or "",
+        end_date=row.end_date,
     )
 
 
@@ -75,13 +111,12 @@ def _assert_create_permissions(body: StaffCreate, actor: User, role: str) -> Non
         )
     if body.is_owner:
         require_tenant_management_access(actor, role)
-    if body.is_branch_admin and not has_tenant_management_access(actor, role):
-        pass  # branch admins may create other branch admins in their branches
 
 
 @router.get("", response_model=list[StaffOut])
 def list_staff(
     center_id: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
     payload: dict = Depends(get_token_payload),
@@ -94,6 +129,16 @@ def list_staff(
     )
 
     role = get_effective_role(payload, user)
+    year = None
+    if academic_year_id:
+        year = enr_svc.resolve_academic_year(
+            db,
+            user.institution_id,
+            academic_year_id=academic_year_id,
+            required=True,
+            default_to_current=False,
+        )
+
     rows = (
         db.query(User)
         .filter(
@@ -121,7 +166,29 @@ def list_staff(
                 filtered.append(row)
         rows = filtered
     scope = resolve_branch_filter(db, user, role, center_id)
-    return [_staff_out(db, row) for row in rows if user_matches_center_scope(db, row, scope)]
+    rows = [row for row in rows if user_matches_center_scope(db, row, scope)]
+
+    if not year:
+        return [_staff_out(db, row) for row in rows]
+
+    assignments = {
+        a.staff_id: a
+        for a in sa_svc.list_assignments_for_year(
+            db,
+            user.institution_id,
+            year.id,
+            center_id=center_id if center_id else None,
+        )
+    }
+    out: list[StaffOut] = []
+    for row in rows:
+        assignment = assignments.get(row.id)
+        if not assignment:
+            continue
+        if center_id and assignment.center_id != center_id:
+            continue
+        out.append(_staff_out(db, row, assignment=assignment, academic_year_id=year.id))
+    return out
 
 
 @router.post("", response_model=StaffOut, status_code=status.HTTP_201_CREATED)
@@ -137,6 +204,17 @@ def create_staff(
     target_roles = _roles_from_create(body)
     if body.center_ids:
         assert_actor_can_assign_centers(db, user, role, body.center_ids)
+
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=body.academic_year_id,
+        required=False,
+        default_to_current=True,
+    )
+    assignment_center = body.assignment_center_id or (body.center_ids[0] if body.center_ids else None)
+    if assignment_center:
+        assert_actor_can_assign_centers(db, user, role, [assignment_center])
 
     email, password = resolve_user_credentials(phone=body.phone, password=body.password)
     existing = db.query(User).filter(User.email == email).first()
@@ -174,6 +252,16 @@ def create_staff(
     if body.center_ids and ("admin" in target_roles or "tutor" in target_roles):
         set_user_center_access(db, user=staff, center_ids=body.center_ids, actor=user)
 
+    assignment = None
+    if year and assignment_center:
+        assignment = sa_svc.ensure_assignment_for_year(
+            db,
+            staff=staff,
+            academic_year_id=year.id,
+            center_id=assignment_center,
+            status_value="active",
+        )
+
     record_audit(
         db,
         institution_id=user.institution_id,
@@ -187,11 +275,65 @@ def create_staff(
             "isOwner": staff.is_owner,
             "centerIds": body.center_ids,
             "roles": parse_roles(staff),
+            "academicYearId": year.id if year else None,
+            "assignmentCenterId": assignment_center,
         },
     )
     db.commit()
     db.refresh(staff)
-    return _staff_out(db, staff)
+    return _staff_out(db, staff, assignment=assignment, academic_year_id=year.id if year else None)
+
+
+@router.get("/{staff_id}/assignments", response_model=list[StaffAssignmentOut])
+def list_staff_assignments(
+    staff_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+) -> list[StaffAssignmentOut]:
+    staff = _get_staff(db, staff_id, user.institution_id)
+    rows = sa_svc.list_assignments_for_staff(db, staff.id)
+    return [_assignment_out(db, row) for row in rows]
+
+
+@router.put("/{staff_id}/assignments/{academic_year_id}", response_model=StaffAssignmentOut)
+def upsert_staff_assignment(
+    staff_id: str,
+    academic_year_id: str,
+    body: StaffAssignmentUpsert,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+    payload: dict = Depends(get_token_payload),
+) -> StaffAssignmentOut:
+    role = get_effective_role(payload, user)
+    staff = _get_staff(db, staff_id, user.institution_id)
+    assert_actor_can_assign_centers(db, user, role, [body.center_id])
+    row = sa_svc.upsert_assignment(
+        db,
+        staff=staff,
+        academic_year_id=academic_year_id,
+        center_id=body.center_id,
+        status_value=body.status,
+        start_date=body.start_date,
+        end_date=body.end_date,
+    )
+    record_audit(
+        db,
+        institution_id=user.institution_id,
+        actor_user_id=user.id,
+        actor_role=role,
+        action="staff_assignment_upsert",
+        entity_type="staff_assignment",
+        entity_id=row.id,
+        new_state={
+            "staffId": staff.id,
+            "academicYearId": academic_year_id,
+            "centerId": body.center_id,
+            "status": body.status,
+        },
+    )
+    db.commit()
+    db.refresh(row)
+    return _assignment_out(db, row)
 
 
 @router.patch("/{staff_id}", response_model=StaffOut)

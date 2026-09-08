@@ -13,6 +13,11 @@ def _auth(client: TestClient) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _tutor_auth(client: TestClient) -> dict[str, str]:
+    token = login(client, "tutor@test.edu", "TEST")
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_add_board_grade_and_subject(client: TestClient, db: Session) -> None:
     headers = _auth(client)
 
@@ -41,6 +46,49 @@ def test_add_board_grade_and_subject(client: TestClient, db: Session) -> None:
     assert {s.name for s in subjects} == {"Mathematics", "Science"}
     assert all(len(s.id) <= 32 for s in subjects)
     assert len(grade.id) <= 32
+
+
+def test_tutor_cannot_add_board_or_grade(client: TestClient) -> None:
+    headers = _tutor_auth(client)
+    board_res = client.post("/api/v1/curriculum/boards", json={"name": "CBSE"}, headers=headers)
+    assert board_res.status_code == 403
+
+    admin = _auth(client)
+    client.post("/api/v1/curriculum/boards", json={"name": "CBSE"}, headers=admin)
+    grade_res = client.post(
+        "/api/v1/curriculum/grades",
+        json={"board": "CBSE", "grade": "Grade 10"},
+        headers=headers,
+    )
+    assert grade_res.status_code == 403
+
+
+def test_tutor_can_add_subject_and_topic(client: TestClient) -> None:
+    admin = _auth(client)
+    client.post("/api/v1/curriculum/boards", json={"name": "CBSE"}, headers=admin)
+    client.post(
+        "/api/v1/curriculum/grades",
+        json={"board": "CBSE", "grade": "Grade 10"},
+        headers=admin,
+    )
+    headers = _tutor_auth(client)
+    subject_res = client.post(
+        "/api/v1/curriculum/subjects",
+        json={"board": "CBSE", "grade": "Grade 10", "subject": "Science"},
+        headers=headers,
+    )
+    assert subject_res.status_code == 201, subject_res.text
+    topic_res = client.post(
+        "/api/v1/curriculum/topics",
+        json={
+            "board": "CBSE",
+            "grade": "Grade 10",
+            "subject": "Science",
+            "topic": "Forces",
+        },
+        headers=headers,
+    )
+    assert topic_res.status_code == 201, topic_res.text
 
 
 def test_add_grade_requires_board(client: TestClient) -> None:

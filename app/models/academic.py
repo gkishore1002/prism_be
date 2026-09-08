@@ -86,5 +86,10 @@ class Question(Base):
     option_c: Mapped[str | None] = mapped_column(Text, nullable=True)
     option_d: Mapped[str | None] = mapped_column(Text, nullable=True)
     correct_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    text_image_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    option_a_image_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    option_b_image_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    option_c_image_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    option_d_image_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     topic_rel: Mapped["Topic"] = relationship(back_populates="questions")

@@ -1,7 +1,13 @@
-"""Build and persist per-assessment student reports."""
+"""Build and persist per-assessment student reports.
+
+AI summaries are generated only when an assessment result is finalized or the
+assessment is marked completed. Report reads never call Vertex — they return
+stored copy (or rule-based placeholders if nothing is stored yet).
+"""
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime
 from statistics import mean
@@ -12,6 +18,8 @@ from app.models.assessment import Assessment, AssessmentStudentReport, Assessmen
 from app.models.user import StudentProfile
 from app.services import analytics_recompute as recompute_svc
 from app.services import vertex_summary as vertex_svc
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_json_list(raw: str) -> list:
@@ -216,7 +224,13 @@ def build_and_store_assessment_report(
     student_id: str,
     *,
     commit: bool = True,
+    force: bool = False,
+    use_ai: bool = True,
 ) -> dict | None:
+    """Generate (optionally via Vertex) and persist an assessment report.
+
+    Call with use_ai=True only from assessment submit / mark-completed flows.
+    """
     profile = db.get(StudentProfile, student_id)
     assessment = db.get(Assessment, assessment_id)
     if not profile or not assessment:
@@ -241,7 +255,7 @@ def build_and_store_assessment_report(
         )
         .first()
     )
-    if existing:
+    if existing and not force:
         _ensure_tamil_fields(db, existing)
         return _report_dict(db, existing)
 
@@ -267,6 +281,9 @@ def build_and_store_assessment_report(
         strong_topics,
         weak_topics,
     )
+    rule_summary_ta = _rule_summary_ta(
+        profile.user.name, assessment.title, assessment.subject, accuracy
+    )
     context = {
         "studentName": profile.user.name,
         "assessmentTitle": assessment.title,
@@ -284,53 +301,86 @@ def build_and_store_assessment_report(
         "weakTopics": weak_topics,
         "subjectScores": subject_scores,
     }
-    ai_summary, ai_summary_ta = vertex_svc.generate_pair_parallel(
-        vertex_svc.generate_assessment_report_summary,
-        vertex_svc.generate_assessment_report_summary_ta,
-        context,
-    )
-    summary = ai_summary or rule_summary
-    summary_source = "vertex" if ai_summary else "rule-based"
-    summary_ta = ai_summary_ta or _rule_summary_ta(
-        profile.user.name, assessment.title, assessment.subject, accuracy
-    )
+
+    summary = rule_summary
+    summary_ta = rule_summary_ta
+    summary_source = "rule-based"
+    if use_ai:
+        ai_summary, ai_summary_ta = vertex_svc.generate_pair_parallel(
+            vertex_svc.generate_assessment_report_summary,
+            vertex_svc.generate_assessment_report_summary_ta,
+            context,
+        )
+        if ai_summary:
+            summary = ai_summary
+            summary_source = "vertex"
+        if ai_summary_ta:
+            summary_ta = ai_summary_ta
+
     student_msg_en = _student_message_en(assessment.title, accuracy)
     student_msg_ta = _student_message_ta(assessment.title, accuracy)
     computed_at = datetime.now().isoformat(timespec="minutes")
 
-    report = AssessmentStudentReport(
-        id=f"asr-{uuid.uuid4().hex[:8]}",
-        assessment_id=assessment_id,
-        student_id=student_id,
-        submission_id=submission.id,
-        assessment_title=assessment.title,
-        subject=assessment.subject,
-        score=submission.score,
-        max_score=submission.max_score,
-        accuracy_pct=accuracy,
-        class_avg_pct=assessment.class_avg,
-        rank_in_class=rank,
-        total_in_class=total or None,
-        time_spent_min=submission.time_spent_min,
-        submitted_at=submission.submitted_at,
-        subject_scores=json.dumps(subject_scores),
-        strong_topics=json.dumps(strong_topics),
-        weak_topics=json.dumps(weak_topics),
-        summary=summary,
-        summary_ta=summary_ta,
-        student_message_en=student_msg_en,
-        student_message_ta=student_msg_ta,
-        summary_source=summary_source,
-        computed_at=computed_at,
-    )
-    db.add(report)
+    if existing:
+        report = existing
+        report.submission_id = submission.id
+        report.assessment_title = assessment.title
+        report.subject = assessment.subject
+        report.score = submission.score
+        report.max_score = submission.max_score
+        report.accuracy_pct = accuracy
+        report.class_avg_pct = assessment.class_avg
+        report.rank_in_class = rank
+        report.total_in_class = total or None
+        report.time_spent_min = submission.time_spent_min
+        report.submitted_at = submission.submitted_at
+        report.subject_scores = json.dumps(subject_scores)
+        report.strong_topics = json.dumps(strong_topics)
+        report.weak_topics = json.dumps(weak_topics)
+        report.summary = summary
+        report.summary_ta = summary_ta
+        report.student_message_en = student_msg_en
+        report.student_message_ta = student_msg_ta
+        report.summary_source = summary_source
+        report.computed_at = computed_at
+    else:
+        report = AssessmentStudentReport(
+            id=f"asr-{uuid.uuid4().hex[:8]}",
+            assessment_id=assessment_id,
+            student_id=student_id,
+            submission_id=submission.id,
+            assessment_title=assessment.title,
+            subject=assessment.subject,
+            score=submission.score,
+            max_score=submission.max_score,
+            accuracy_pct=accuracy,
+            class_avg_pct=assessment.class_avg,
+            rank_in_class=rank,
+            total_in_class=total or None,
+            time_spent_min=submission.time_spent_min,
+            submitted_at=submission.submitted_at,
+            subject_scores=json.dumps(subject_scores),
+            strong_topics=json.dumps(strong_topics),
+            weak_topics=json.dumps(weak_topics),
+            summary=summary,
+            summary_ta=summary_ta,
+            student_message_en=student_msg_en,
+            student_message_ta=student_msg_ta,
+            summary_source=summary_source,
+            computed_at=computed_at,
+        )
+        db.add(report)
+
     if commit:
         db.commit()
         db.refresh(report)
+    else:
+        db.flush()
     return _report_dict(db, report)
 
 
 def get_assessment_report(db: Session, assessment_id: str, student_id: str) -> dict | None:
+    """Return the stored assessment report only — never calls Vertex."""
     report = (
         db.query(AssessmentStudentReport)
         .filter(
@@ -342,7 +392,10 @@ def get_assessment_report(db: Session, assessment_id: str, student_id: str) -> d
     if report:
         _ensure_tamil_fields(db, report)
         return _report_dict(db, report)
-    return build_and_store_assessment_report(db, assessment_id, student_id)
+    # No stored AI report yet — return rule-based snapshot without Vertex.
+    return build_and_store_assessment_report(
+        db, assessment_id, student_id, force=False, use_ai=False
+    )
 
 
 def get_assessment_report_summary(db: Session, assessment_id: str, student_id: str) -> dict | None:
@@ -375,6 +428,7 @@ def get_assessment_report_summary(db: Session, assessment_id: str, student_id: s
 
 
 def list_assessment_reports(db: Session, student_id: str) -> list[dict]:
+    """List stored assessment reports. Never triggers Vertex on read."""
     stored = (
         db.query(AssessmentStudentReport)
         .filter(AssessmentStudentReport.student_id == student_id)
@@ -404,7 +458,46 @@ def list_assessment_reports(db: Session, student_id: str) -> list[dict]:
             _ensure_tamil_fields(db, report)
             results.append(_report_dict(db, report))
             continue
-        built = build_and_store_assessment_report(db, sub.assessment_id, student_id)
+        # Persist rule-based copy so the list stays fast; AI fills in on next assessment update.
+        built = build_and_store_assessment_report(
+            db, sub.assessment_id, student_id, use_ai=False
+        )
         if built:
             results.append(built)
     return results
+
+
+def refresh_reports_for_assessment(db: Session, assessment_id: str) -> list[str]:
+    """Force AI regenerate for every attended student on this assessment + overall insights."""
+    from app.services.student_overall_report import build_and_store_overall_report
+
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment:
+        return []
+
+    student_ids = [
+        row.student_id
+        for row in db.query(AssessmentSubmission.student_id)
+        .filter(
+            AssessmentSubmission.assessment_id == assessment_id,
+            AssessmentSubmission.status == "attended",
+        )
+        .distinct()
+        .all()
+    ]
+    refreshed: list[str] = []
+    for student_id in student_ids:
+        try:
+            build_and_store_assessment_report(
+                db, assessment_id, student_id, force=True, use_ai=True, commit=False
+            )
+            build_and_store_overall_report(db, student_id, use_ai=True, commit=False)
+            refreshed.append(student_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed refreshing reports assessment=%s student=%s",
+                assessment_id,
+                student_id,
+            )
+    db.commit()
+    return refreshed

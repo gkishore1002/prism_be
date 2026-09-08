@@ -1,8 +1,9 @@
 import json
+import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.questions import _question_out
@@ -10,7 +11,7 @@ from app.core.deps import get_current_user, get_db, get_effective_role, get_toke
 from app.core.pagination import PaginatedOut
 from app.core.routing import CamelCaseAPIRoute
 from app.models.academic import Question
-from app.models.assessment import Assessment, AssessmentSubmission
+from app.models.assessment import Assessment, AssessmentStudentReport, AssessmentSubmission
 from app.models.csc import AssessmentAccessRequest
 from app.models.user import StudentProfile, User
 from app.services.assessment_access import (
@@ -22,6 +23,7 @@ from app.services.assessment_access import (
     mark_absent_for_pending_students,
 )
 from app.services.assessment_queries import list_assessments_for_student
+from app.services.assessment_report import refresh_reports_for_assessment
 from app.services.submissions import (
     existing_attempt,
     existing_submission,
@@ -32,6 +34,13 @@ from app.services.institution_policies import get_assessment_policy
 from app.services.notification_dispatch import notify_reassignment_requested, notify_reassignment_reviewed
 from app.services.audit_log import record_audit
 from app.services import exam_proctoring as proctor_svc
+from app.services import enrollments as enr_svc
+from app.services.tenant_context import (
+    close_tenant_db,
+    open_tenant_db,
+    safe_reset_tenant_context,
+    set_tenant_context,
+)
 from app.schemas import (
     AssessmentAccessRequestCreate,
     AssessmentAccessRequestOut,
@@ -54,7 +63,31 @@ from app.schemas import (
 )
 from app.utils import dict_get, from_json_list, to_json_list
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["assessments"], route_class=CamelCaseAPIRoute)
+
+
+def _refresh_reports_after_assessment_update(
+    assessment_id: str,
+    schema_name: str | None,
+    institution_id: str,
+) -> None:
+    """Background: regenerate stored assessment + overall AI reports after mark completed."""
+    tokens = set_tenant_context(schema_name=schema_name or "public", institution_id=institution_id)
+    db = open_tenant_db(schema_name)
+    try:
+        refreshed = refresh_reports_for_assessment(db, assessment_id)
+        logger.info(
+            "Refreshed stored reports for assessment=%s students=%s",
+            assessment_id,
+            len(refreshed),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Report refresh failed for assessment=%s", assessment_id)
+    finally:
+        close_tenant_db(db)
+        safe_reset_tenant_context(tokens)
 
 
 def _client_meta(request: Request) -> tuple[str | None, str | None]:
@@ -169,6 +202,7 @@ def _assessment_out(
         timing_over=timing_over,
         access_request_status=access_request_status,  # type: ignore[arg-type]
         can_attend=can_attend,
+        created_at=getattr(a, "created_at", None) or "",
     )
 
 
@@ -192,16 +226,11 @@ def list_assessments(
         q = q.filter(Assessment.status == status_filter)
     if tutor_id:
         q = q.filter(Assessment.created_by_tutor_id == tutor_id)
-    q = q.order_by(Assessment.scheduled_at.desc())
+    q = q.order_by(Assessment.created_at.desc(), Assessment.scheduled_at.desc())
     rows = q.all()
     rows = [a for a in rows if assessment_matches_branch_scope(a.center_ids, scope)]
-    updated = False
-    for a in rows:
-        if a.class_avg is None:
-            update_assessment_class_avg(db, a.id)
-            updated = True
-    if updated:
-        db.commit()
+    # Do not recompute class_avg on list — that was O(assessments × submissions) and
+    # blocked every admin/tutor shell load. Averages are updated on submit / attendance.
     if page is None and limit is None:
         return [_assessment_out(a) for a in rows]
     total = len(rows)
@@ -470,9 +499,18 @@ def create_assessment(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> AssessmentOut:
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=body.academic_year_id,
+        academic_year=body.academic_year,
+    )
+    if not year:
+        year = enr_svc.ensure_academic_year(db, user.institution_id, "2025-26", make_current=True)
     assessment = Assessment(
         id=f"ta-{uuid.uuid4().hex[:8]}",
         institution_id=user.institution_id,
+        academic_year_id=year.id,
         title=body.title,
         board=body.board,
         grade=body.grade,
@@ -495,6 +533,7 @@ def create_assessment(
         paper_coverage=body.paper_coverage,
         selected_topics=to_json_list(body.selected_topics or []),
         shuffle_questions=body.shuffle_questions,
+        created_at=datetime.now().isoformat(timespec="seconds"),
     )
     db.add(assessment)
     db.commit()
@@ -505,6 +544,8 @@ def create_assessment(
 def update_assessment(
     assessment_id: str,
     body: AssessmentUpdate,
+    request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> AssessmentOut:
@@ -522,10 +563,22 @@ def update_assessment(
         a.available_until = body.available_until
     if body.assigned_student_ids is not None:
         a.assigned_student_ids = to_json_list(body.assigned_student_ids)
-    if body.status == "completed" and prev_status != "completed":
+    just_completed = body.status == "completed" and prev_status != "completed"
+    if just_completed:
         mark_absent_for_pending_students(db, a)
     db.commit()
+
+    if just_completed:
+        schema_name = getattr(request.state, "tenant_schema", None)
+        background_tasks.add_task(
+            _refresh_reports_after_assessment_update,
+            assessment_id,
+            schema_name,
+            user.institution_id,
+        )
+
     return _assessment_out(a)
+
 
 
 @router.delete("/assessments/{assessment_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -537,6 +590,9 @@ def delete_assessment(
     a = db.get(Assessment, assessment_id)
     if not a or a.institution_id != user.institution_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment not found")
+    db.query(AssessmentStudentReport).filter(
+        AssessmentStudentReport.assessment_id == assessment_id
+    ).delete()
     db.query(AssessmentSubmission).filter(AssessmentSubmission.assessment_id == assessment_id).delete()
     db.delete(a)
     db.commit()
@@ -630,10 +686,18 @@ def save_exam_attempt(
     remaining = body.remaining_seconds if body.remaining_seconds is not None else 0
     sub = existing_attempt(db, assessment_id, profile.id)
     if sub is None:
+        enrollment = None
+        if assessment.academic_year_id:
+            enrollment = enr_svc.get_enrollment_for_year(
+                db, profile.id, assessment.academic_year_id
+            )
+        if not enrollment:
+            enrollment = enr_svc.get_active_enrollment(db, profile)
         sub = AssessmentSubmission(
             id=f"sub-{uuid.uuid4().hex[:8]}",
             assessment_id=assessment_id,
             student_id=profile.id,
+            enrollment_id=enrollment.id if enrollment else profile.current_enrollment_id,
             score=0,
             max_score=0,
             time_spent_min=0,

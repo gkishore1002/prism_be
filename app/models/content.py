@@ -10,6 +10,9 @@ class Batch(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
+    academic_year_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("academic_years.id"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(128))
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
