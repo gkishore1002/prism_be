@@ -83,14 +83,45 @@ def _resolve_center_id(
     name = center_name.strip()
     if not name:
         return None
-    center = (
+
+    centers = (
         db.query(Center)
-        .filter(Center.institution_id == institution_id, Center.name.ilike(name))
-        .first()
+        .filter(Center.institution_id == institution_id, Center.active.is_(True))
+        .all()
     )
-    if not center:
-        raise ValueError(f"Branch not found: {name}")
-    return center.id
+    needle = name.casefold()
+
+    def score(center: Center) -> int:
+        center_name_cf = (center.name or "").casefold()
+        city_cf = (center.city or "").casefold()
+        label = f"{center_name_cf} · {city_cf}".strip(" ·")
+        alt_label = f"{center_name_cf} - {city_cf}".strip(" -")
+        if center_name_cf == needle or city_cf == needle or label == needle or alt_label == needle:
+            return 100
+        if needle in center_name_cf or (city_cf and needle in city_cf):
+            return 80
+        if center_name_cf in needle or (city_cf and city_cf in needle):
+            return 60
+        return 0
+
+    ranked = sorted(((score(c), c) for c in centers), key=lambda item: item[0], reverse=True)
+    if ranked and ranked[0][0] > 0:
+        best_score = ranked[0][0]
+        ties = [c for s, c in ranked if s == best_score]
+        if len(ties) == 1:
+            return ties[0].id
+        names = ", ".join(sorted({c.name for c in ties}))
+        raise ValueError(f"Branch '{name}' matches multiple centers ({names}). Use the exact branch name.")
+
+    available = ", ".join(
+        sorted(
+            {
+                f"{c.name}" + (f" · {c.city}" if (c.city or "").strip() else "")
+                for c in centers
+            }
+        )
+    ) or "none"
+    raise ValueError(f"Branch not found: {name}. Available: {available}")
 
 
 def _resolve_center_ids(

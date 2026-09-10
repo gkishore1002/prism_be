@@ -1,4 +1,5 @@
 import hashlib
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -27,6 +28,7 @@ from app.services.branch_access import (
     assert_can_access_student,
     apply_branch_scope_to_students,
 )
+from app.services.subjects_list import normalize_subjects, primary_subject, subjects_from_stored, subjects_json
 from app.services.student_tracking import latest_collections_for_students
 from app.schemas import (
     AddBoardRequest,
@@ -322,11 +324,17 @@ def _assign_student_to_batch_row(
 
 
 def _unique_batch_id(db: Session, name: str) -> str:
-    base_id = f"batch-{name.lower().replace(' ', '-')}"
+    # batches.id is VARCHAR(32); keep slug short and collision-safe.
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower()).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    slug = (slug or "batch")[:18]
+    base_id = f"batch-{slug}"[:28]
     batch_id = base_id
     suffix = 1
     while db.get(Batch, batch_id):
-        batch_id = f"{base_id}-{suffix}"
+        suffix_str = f"-{suffix}"
+        batch_id = f"{base_id[: 32 - len(suffix_str)]}{suffix_str}"
         suffix += 1
     return batch_id
 
@@ -893,7 +901,7 @@ def create_student(
     payload: dict = Depends(get_token_payload),
 ) -> StudentMasterOut:
     role = get_effective_role(payload, user)
-    sid = f"stu-{len(db.query(StudentProfile).all()) + 10}"
+    sid = f"stu-{uuid.uuid4().hex[:8]}"
     if body.phone:
         from app.services.user_credentials import resolve_user_credentials
 
@@ -924,6 +932,7 @@ def create_student(
         email=email,
         password_hash=hash_password(password),
         role="student",
+        roles="student",
     )
     profile = StudentProfile(
         id=sid,
@@ -938,8 +947,9 @@ def create_student(
     db.add_all([new_user, profile])
     db.flush()
     batch_row = None
-    if body.batch_id:
-        batch_row = _get_batch(db, body.batch_id, user.institution_id)
+    batch_id = (body.batch_id or "").strip() or None
+    if batch_id:
+        batch_row = _get_batch(db, batch_id, user.institution_id)
         _assign_student_to_batch_row(db, batch_row, sid)
     elif body.batch and body.batch.strip():
         batch_row = (
@@ -964,12 +974,24 @@ def create_student(
         year = enr_svc.ensure_academic_year(
             db, user.institution_id, body.academic_year or "2025-26", make_current=True
         )
+    # Prefer the batch's board/grade/year so new-batch enrollment stays consistent.
+    enroll_board = batch_row.board if batch_row else body.board
+    enroll_grade = batch_row.grade if batch_row else body.grade
+    if batch_row and batch_row.academic_year_id:
+        from app.models.enrollment import AcademicYear
+
+        batch_year = db.get(AcademicYear, batch_row.academic_year_id)
+        if batch_year and batch_year.institution_id == user.institution_id:
+            year = batch_year
+    profile.board = enroll_board
+    profile.grade = enroll_grade
+    profile.academic_year = year.name
     enr_svc.create_enrollment(
         db,
         student_id=sid,
         academic_year_id=year.id,
-        board=body.board,
-        grade=body.grade,
+        board=enroll_board,
+        grade=enroll_grade,
         batch_id=batch_row.id if batch_row else None,
         center_id=center_id,
         enrollment_status="active",
@@ -1056,12 +1078,14 @@ def delete_student(
 
 def _batch_out(db: Session, batch: Batch) -> TutorBatchOut:
     student_ids = [row.student_id for row in db.query(BatchStudent).filter(BatchStudent.batch_id == batch.id).all()]
+    subjects = subjects_from_stored(batch.subject, getattr(batch, "subjects", None))
     return TutorBatchOut(
         id=batch.id,
         name=batch.name,
         board=batch.board,
         grade=batch.grade,
-        subject=batch.subject,
+        subject=primary_subject(subjects) or batch.subject,
+        subjects=subjects,
         schedule_timing=batch.schedule_timing,
         student_ids=student_ids,
         avg_score=batch.avg_score,
@@ -1147,9 +1171,13 @@ def create_batch(
         user.institution_id,
         academic_year_id=body.academic_year_id,
         academic_year=body.academic_year,
+        default_to_current=True,
     )
     if not year:
-        year = enr_svc.ensure_academic_year(db, user.institution_id, "2025-26", make_current=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Academic year is required. Create an academic year first.",
+        )
     existing_q = db.query(Batch).filter(
         Batch.institution_id == user.institution_id,
         Batch.board == body.board,
@@ -1162,6 +1190,7 @@ def create_batch(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Batch already exists for this board and grade")
     batch_id = _unique_batch_id(db, name)
     schedule_timing = body.schedule_timing.strip() if body.schedule_timing else None
+    subjects = normalize_subjects(body.subjects, body.subject)
     batch = Batch(
         id=batch_id,
         institution_id=user.institution_id,
@@ -1169,7 +1198,8 @@ def create_batch(
         name=name,
         board=body.board,
         grade=body.grade,
-        subject=body.subject,
+        subject=primary_subject(subjects) or None,
+        subjects=subjects_json(subjects),
         schedule_timing=schedule_timing or None,
     )
     db.add(batch)
@@ -1190,8 +1220,14 @@ def update_batch(
     batch = _get_batch(db, batch_id, user.institution_id)
     if body.name:
         batch.name = body.name
-    if body.subject is not None:
-        batch.subject = body.subject
+    if body.subjects is not None:
+        subjects = normalize_subjects(body.subjects)
+        batch.subjects = subjects_json(subjects)
+        batch.subject = primary_subject(subjects) or None
+    elif body.subject is not None:
+        subjects = normalize_subjects(body.subject)
+        batch.subjects = subjects_json(subjects)
+        batch.subject = primary_subject(subjects) or None
     if body.schedule_timing is not None:
         batch.schedule_timing = body.schedule_timing.strip() or None
     if body.avg_score is not None:

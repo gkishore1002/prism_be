@@ -427,7 +427,13 @@ def get_assessment_report_summary(db: Session, assessment_id: str, student_id: s
     }
 
 
-def list_assessment_reports(db: Session, student_id: str) -> list[dict]:
+def list_assessment_reports(
+    db: Session,
+    student_id: str,
+    *,
+    academic_year_id: str | None = None,
+    enrollment_id: str | None = None,
+) -> list[dict]:
     """List stored assessment reports. Never triggers Vertex on read."""
     stored = (
         db.query(AssessmentStudentReport)
@@ -437,15 +443,13 @@ def list_assessment_reports(db: Session, student_id: str) -> list[dict]:
     )
     stored_by_assessment = {row.assessment_id: row for row in stored}
 
-    submissions = (
-        db.query(AssessmentSubmission)
-        .filter(
-            AssessmentSubmission.student_id == student_id,
-            AssessmentSubmission.status == "attended",
-        )
-        .order_by(AssessmentSubmission.submitted_at.desc())
-        .all()
+    submissions_q = db.query(AssessmentSubmission).filter(
+        AssessmentSubmission.student_id == student_id,
+        AssessmentSubmission.status == "attended",
     )
+    if enrollment_id:
+        submissions_q = submissions_q.filter(AssessmentSubmission.enrollment_id == enrollment_id)
+    submissions = submissions_q.order_by(AssessmentSubmission.submitted_at.desc()).all()
 
     results: list[dict] = []
     seen: set[str] = set()
@@ -453,6 +457,10 @@ def list_assessment_reports(db: Session, student_id: str) -> list[dict]:
         if sub.assessment_id in seen:
             continue
         seen.add(sub.assessment_id)
+        if academic_year_id:
+            assessment = db.get(Assessment, sub.assessment_id)
+            if not assessment or assessment.academic_year_id != academic_year_id:
+                continue
         report = stored_by_assessment.get(sub.assessment_id)
         if report:
             _ensure_tamil_fields(db, report)

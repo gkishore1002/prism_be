@@ -463,6 +463,7 @@ class TutorBatchOut(CamelModel):
     board: str
     grade: str
     subject: str | None = None
+    subjects: list[str] = []
     schedule_timing: str | None = None
     student_ids: list[str] = []
     avg_score: int | None = None
@@ -474,6 +475,7 @@ class TutorBatchCreate(CamelModel):
     board: str
     grade: str
     subject: str | None = None
+    subjects: list[str] = Field(default_factory=list)
     schedule_timing: str | None = None
     student_ids: list[str] = Field(default_factory=list)
     academic_year_id: str | None = None
@@ -483,6 +485,7 @@ class TutorBatchCreate(CamelModel):
 class TutorBatchUpdate(CamelModel):
     name: str | None = None
     subject: str | None = None
+    subjects: list[str] | None = None
     schedule_timing: str | None = None
     avg_score: int | None = None
 
@@ -635,6 +638,7 @@ class QuestionPaperOut(CamelModel):
     board: str
     grade: str
     subject: str
+    subjects: list[str] = []
     question_ids: list[str]
     topics: list[str]
     total_marks: int
@@ -648,7 +652,8 @@ class QuestionPaperCreate(CamelModel):
     name: str
     board: str
     grade: str
-    subject: str
+    subject: str = ""
+    subjects: list[str] = Field(default_factory=list)
     question_ids: list[str]
     source: Literal["upload", "custom", "manual"] = "upload"
     parent_paper_id: str | None = None
@@ -734,6 +739,7 @@ class AssessmentOut(CamelModel):
     board: str
     grade: str
     subject: str
+    subjects: list[str] = []
     scope: Literal["subject", "chapter", "topic"]
     mode: Literal["practice", "assessment"]
     batch_name: str
@@ -759,13 +765,15 @@ class AssessmentOut(CamelModel):
     access_request_status: Literal["pending", "approved", "rejected"] | None = None
     can_attend: bool = False
     created_at: str = ""
+    academic_year_id: str | None = None
 
 
 class AssessmentCreate(CamelModel):
     title: str
     board: str
     grade: str
-    subject: str
+    subject: str = ""
+    subjects: list[str] = Field(default_factory=list)
     scope: Literal["subject", "chapter", "topic"] = "topic"
     mode: Literal["practice", "assessment"] = "assessment"
     batch_name: str

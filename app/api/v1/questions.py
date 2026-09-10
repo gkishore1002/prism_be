@@ -24,6 +24,13 @@ from app.schemas import (
 from app.utils import from_json_list, to_json_list
 from app.services.syllabus_books import fill_blank_question_topics
 from app.services import question_media as media_svc
+from app.services.subjects_list import (
+    normalize_subjects,
+    primary_subject,
+    subjects_from_stored,
+    subjects_json,
+    subjects_overlap,
+)
 
 router = APIRouter(tags=["questions", "question-papers"], route_class=CamelCaseAPIRoute)
 
@@ -60,12 +67,14 @@ def _question_out(q: Question, *, hide_answer: bool = False) -> QuestionOut:
 
 
 def _paper_out(p: QuestionPaper) -> QuestionPaperOut:
+    subjects = subjects_from_stored(p.subject, getattr(p, "subjects", None))
     return QuestionPaperOut(
         id=p.id,
         name=p.name,
         board=p.board,
         grade=p.grade,
-        subject=p.subject,
+        subject=primary_subject(subjects, p.subject),
+        subjects=subjects,
         question_ids=from_json_list(p.question_ids),
         topics=from_json_list(p.topics),
         total_marks=p.total_marks,
@@ -243,12 +252,19 @@ def list_question_papers(
         q = q.filter(QuestionPaper.board == board)
     if grade:
         q = q.filter(QuestionPaper.grade == grade)
-    if subject:
-        q = q.filter(QuestionPaper.subject == subject)
     q = q.order_by(QuestionPaper.created_at.desc(), QuestionPaper.id.desc())
+    rows = q.all()
+    if subject:
+        want = normalize_subjects(subject)
+        rows = [p for p in rows if subjects_overlap(want, subjects_from_stored(p.subject, getattr(p, "subjects", None)))]
     if page is None and limit is None:
-        return [_paper_out(p) for p in q.all()]
-    items, total, page_n, limit_n, pages = paginate_query(q, page or 1, limit)
+        return [_paper_out(p) for p in rows]
+    total = len(rows)
+    page_n = page or 1
+    limit_n = limit or 20
+    pages = max(1, (total + limit_n - 1) // limit_n) if total else 1
+    start = (page_n - 1) * limit_n
+    items = rows[start : start + limit_n]
     return PaginatedOut(
         items=[_paper_out(p) for p in items],
         total=total,
@@ -283,13 +299,15 @@ def create_question_paper(
     )
     topics = sorted({q.topic_name for q in questions})
     total = sum(q.marks for q in questions)
+    subjects = normalize_subjects(body.subjects, body.subject, [q.subject for q in questions])
     paper = QuestionPaper(
         id=f"qp-{uuid.uuid4().hex[:8]}",
         institution_id=user.institution_id,
         name=body.name,
         board=body.board,
         grade=body.grade,
-        subject=body.subject,
+        subject=primary_subject(subjects, body.subject),
+        subjects=subjects_json(subjects),
         question_ids=to_json_list(body.question_ids),
         topics=to_json_list(topics),
         total_marks=total,
@@ -345,7 +363,8 @@ def create_question_paper_bulk(
     first = created[0]
     board = first.board
     grade = first.grade
-    subject = first.subject
+    subjects = normalize_subjects([q.subject for q in created])
+    subject = primary_subject(subjects, first.subject)
     question_ids = [q.id for q in created]
     topics = sorted({q.topic_name for q in created})
     total = sum(q.marks for q in created)
@@ -357,6 +376,7 @@ def create_question_paper_bulk(
         board=board,
         grade=grade,
         subject=subject,
+        subjects=subjects_json(subjects),
         question_ids=to_json_list(question_ids),
         topics=to_json_list(topics),
         total_marks=total,
@@ -378,12 +398,14 @@ def create_custom_paper(
     parent = db.get(QuestionPaper, body.parent_paper_id)
     if not parent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent paper not found")
+    parent_subjects = subjects_from_stored(parent.subject, getattr(parent, "subjects", None))
     return create_question_paper(
         QuestionPaperCreate(
             name=body.name,
             board=parent.board,
             grade=parent.grade,
-            subject=parent.subject,
+            subject=primary_subject(parent_subjects, parent.subject),
+            subjects=parent_subjects,
             question_ids=body.question_ids,
             source="custom",
             parent_paper_id=parent.id,

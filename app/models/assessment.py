@@ -17,6 +17,7 @@ class Assessment(Base):
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
     subject: Mapped[str] = mapped_column(String(128))
+    subjects: Mapped[str] = mapped_column(Text, default="[]")  # JSON list; primary also in subject
     scope: Mapped[str] = mapped_column(String(16), default="topic")
     mode: Mapped[str] = mapped_column(String(16), default="assessment")
     batch_name: Mapped[str] = mapped_column(String(128))

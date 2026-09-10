@@ -317,10 +317,20 @@ def student_overall_report(sid: str = Depends(resolve_student_id), db: Session =
 
 
 @router.get("/student/assessment-reports")
-def student_assessment_reports(sid: str = Depends(resolve_student_id), db: Session = Depends(get_db)) -> list:
+def student_assessment_reports(
+    sid: str = Depends(resolve_student_id),
+    academic_year_id: str | None = Query(None),
+    enrollment_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+) -> list:
     from app.services.assessment_report import list_assessment_reports
 
-    return list_assessment_reports(db, sid)
+    return list_assessment_reports(
+        db,
+        sid,
+        academic_year_id=academic_year_id,
+        enrollment_id=enrollment_id,
+    )
 
 
 @router.get("/student/assessment-reports/{assessment_id}")

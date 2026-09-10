@@ -1042,6 +1042,30 @@ def ensure_question_image_columns(engine: Engine, schema: str | None = None) -> 
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} VARCHAR(255)"))
 
 
+def ensure_multi_subjects_columns(engine: Engine, schema: str | None = None) -> None:
+    """Add subjects JSON columns on batches, question_papers, and assessments."""
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    targets = ("batches", "question_papers", "assessments")
+    with engine.begin() as conn:
+        for table_name in targets:
+            if not inspector.has_table(table_name, schema=schema_kw):
+                continue
+            columns = {c["name"] for c in inspector.get_columns(table_name, schema=schema_kw)}
+            table = f"{schema}.{table_name}" if schema_kw else table_name
+            if "subjects" not in columns:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN subjects TEXT NOT NULL DEFAULT '[]'"))
+            # Backfill from legacy single subject when subjects is still empty.
+            conn.execute(
+                text(
+                    f"UPDATE {table} SET subjects = "
+                    "'[\"' || REPLACE(REPLACE(TRIM(subject), '\\\\', '\\\\\\\\'), '\"', '\\\\\"') || '\"]' "
+                    "WHERE (subjects IS NULL OR subjects = '' OR subjects = '[]') "
+                    "AND subject IS NOT NULL AND TRIM(subject) <> ''"
+                )
+            )
+
+
 def run_migrations(engine: Engine) -> None:
     ensure_batch_schedule_timing(engine)
     ensure_assessment_student_reports(engine)
@@ -1103,5 +1127,9 @@ def run_migrations(engine: Engine) -> None:
     ensure_question_image_columns(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_question_image_columns)
+
+    ensure_multi_subjects_columns(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_multi_subjects_columns)
 
     _ensure_institution_schema_name(engine)

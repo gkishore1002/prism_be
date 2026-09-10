@@ -18,13 +18,30 @@ router = APIRouter(prefix="/exports", tags=["exports"], route_class=CamelCaseAPI
 @router.get("/students.csv")
 def download_students_csv(
     center_id: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "tutor")),
     payload: dict = Depends(get_token_payload),
 ):
+    from app.services import enrollments as enr_svc
+
     role = get_effective_role(payload, user)
     scope = resolve_branch_filter(db, user, role, center_id)
-    return export_students_csv(db, user.institution_id, center_id=center_id, center_ids=scope)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
+    return export_students_csv(
+        db,
+        user.institution_id,
+        center_id=center_id,
+        center_ids=scope,
+        academic_year_id=year.id if year else None,
+    )
 
 
 @router.get("/csc-compliance.csv")

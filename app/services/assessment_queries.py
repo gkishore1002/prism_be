@@ -29,6 +29,7 @@ def list_assessments_for_student(
     *,
     board: str | None = None,
     grade: str | None = None,
+    academic_year_id: str | None = None,
 ) -> list[tuple[Assessment, bool, bool]]:
     """Return (assessment, student_submitted, attempt_in_progress)."""
     attempts = (
@@ -49,6 +50,8 @@ def list_assessments_for_student(
         .filter(Assessment.institution_id == institution_id)
         .order_by(Assessment.created_at.desc(), Assessment.scheduled_at.desc())
     )
+    if academic_year_id:
+        query = query.filter(Assessment.academic_year_id == academic_year_id)
     for assessment in query.all():
         if student_id not in from_json_list(assessment.assigned_student_ids):
             continue

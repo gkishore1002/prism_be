@@ -139,8 +139,10 @@ def get_institution_operational_stats(
         db.query(AssessmentAccessRequest)
         .join(Assessment, Assessment.id == AssessmentAccessRequest.assessment_id)
         .filter(Assessment.institution_id == institution_id)
-        .all()
     )
+    if academic_year_id:
+        reqs = reqs.filter(Assessment.academic_year_id == academic_year_id)
+    reqs = reqs.all()
     centers_count = db.query(Center).filter(Center.institution_id == institution_id).count()
     if center_ids is not None:
         centers_count = len(center_ids)
@@ -171,8 +173,10 @@ def get_institution_operational_stats(
     assessments = (
         db.query(Assessment)
         .filter(Assessment.institution_id == institution_id)
-        .all()
     )
+    if academic_year_id:
+        assessments = assessments.filter(Assessment.academic_year_id == academic_year_id)
+    assessments = assessments.all()
     if center_ids is not None:
         assessments = [
             a
@@ -501,12 +505,17 @@ def get_teachers(
     ).all()
     tutors = [t for t in tutors if _tutor_in_scope(db, t, center_ids)]
     students = _students_for_scope(db, institution_id, center_ids, academic_year_id)
-    batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
-    assessments = (
+    batches_q = db.query(Batch).filter(Batch.institution_id == institution_id)
+    if academic_year_id:
+        batches_q = batches_q.filter(Batch.academic_year_id == academic_year_id)
+    batches = batches_q.all()
+    assessments_q = (
         db.query(Assessment)
         .filter(Assessment.institution_id == institution_id)
-        .all()
     )
+    if academic_year_id:
+        assessments_q = assessments_q.filter(Assessment.academic_year_id == academic_year_id)
+    assessments = assessments_q.all()
     result = []
     for t in tutors:
         tutor_assessments = [a for a in assessments if a.created_by_tutor_id == t.id]
@@ -911,7 +920,9 @@ def get_recent_assessments(
         assessment = db.get(Assessment, sub.assessment_id)
         if not assessment:
             continue
-        if academic_year_id and assessment.academic_year_id and assessment.academic_year_id != academic_year_id:
+        if academic_year_id and (
+            not assessment.academic_year_id or assessment.academic_year_id != academic_year_id
+        ):
             continue
         accuracy = round((sub.score / sub.max_score) * 100) if sub.max_score else 0
         strong_topics, weak_topics = recompute_svc.submission_topic_tags(

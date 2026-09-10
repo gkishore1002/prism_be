@@ -12,7 +12,6 @@ from app.models.assessment import Assessment
 from app.models.csc import AssessmentAccessRequest
 from app.models.institution import Center
 from app.models.user import StudentProfile, User
-from app.services.analytics import _students_for_institution
 from app.services.csc_eligibility import days_until_csc_disable
 from app.services.institution_policies import get_csc_policy
 
@@ -43,8 +42,21 @@ def export_students_csv(
     institution_id: str,
     center_id: str | None = None,
     center_ids: list[str] | None = None,
+    academic_year_id: str | None = None,
 ) -> StreamingResponse:
-    students = _filter_by_center(_students_for_institution(db, institution_id), center_id, center_ids)
+    from app.services.student_master import apply_student_master_filters, student_master_base_query
+
+    q = student_master_base_query(db, institution_id)
+    q = apply_student_master_filters(
+        q,
+        center=center_id,
+        academic_year_id=academic_year_id,
+        institution_id=institution_id,
+        db=db,
+    )
+    students = q.all()
+    if center_id is None and center_ids is not None:
+        students = [s for s in students if s.center_id in center_ids]
     centers = {c.id: c.name for c in db.query(Center).filter(Center.institution_id == institution_id).all()}
     rows = []
     for s in students:

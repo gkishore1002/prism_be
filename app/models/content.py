@@ -17,6 +17,7 @@ class Batch(Base):
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
     subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    subjects: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of subject names
     schedule_timing: Mapped[str | None] = mapped_column(String(128), nullable=True)
     avg_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -37,6 +38,7 @@ class QuestionPaper(Base):
     board: Mapped[str] = mapped_column(String(64))
     grade: Mapped[str] = mapped_column(String(64))
     subject: Mapped[str] = mapped_column(String(128))
+    subjects: Mapped[str] = mapped_column(Text, default="[]")  # JSON list; primary also in subject
     question_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON
     topics: Mapped[str] = mapped_column(Text, default="[]")  # JSON
     total_marks: Mapped[int] = mapped_column(Integer, default=0)

@@ -35,6 +35,7 @@ from app.services.notification_dispatch import notify_reassignment_requested, no
 from app.services.audit_log import record_audit
 from app.services import exam_proctoring as proctor_svc
 from app.services import enrollments as enr_svc
+from app.services.subjects_list import normalize_subjects, primary_subject, subjects_from_stored, subjects_json
 from app.services.tenant_context import (
     close_tenant_db,
     open_tenant_db,
@@ -172,12 +173,14 @@ def _assessment_out(
         timing_over = is_past_deadline(a, student_id, db) and not submitted
         access_request_status = get_access_request_status(db, a.id, student_id)  # type: ignore[assignment]
         can_attend = can_student_attend(db, a, student_id, has_submission=submitted)
+    subjects = subjects_from_stored(a.subject, getattr(a, "subjects", None))
     return AssessmentOut(
         id=a.id,
         title=a.title,
         board=a.board,
         grade=a.grade,
-        subject=a.subject,
+        subject=primary_subject(subjects, a.subject),
+        subjects=subjects,
         scope=a.scope,  # type: ignore[arg-type]
         mode=a.mode,  # type: ignore[arg-type]
         batch_name=a.batch_name,
@@ -203,6 +206,7 @@ def _assessment_out(
         access_request_status=access_request_status,  # type: ignore[arg-type]
         can_attend=can_attend,
         created_at=getattr(a, "created_at", None) or "",
+        academic_year_id=getattr(a, "academic_year_id", None),
     )
 
 
@@ -211,6 +215,8 @@ def list_assessments(
     status_filter: str | None = Query(None, alias="status"),
     tutor_id: str | None = Query(None),
     center_id: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     page: int | None = Query(None, ge=1),
     limit: int | None = Query(None, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -221,7 +227,16 @@ def list_assessments(
 
     role = get_effective_role(payload, user)
     scope = resolve_branch_filter(db, user, role, center_id)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
     q = db.query(Assessment).filter(Assessment.institution_id == user.institution_id)
+    if year:
+        q = q.filter(Assessment.academic_year_id == year.id)
     if status_filter:
         q = q.filter(Assessment.status == status_filter)
     if tutor_id:
@@ -269,17 +284,27 @@ def list_student_assessments(
     student_id: str,
     board: str | None = Query(None),
     grade: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     payload: dict = Depends(get_token_payload),
 ) -> list[AssessmentOut]:
     sid = _resolve_student_profile_id(db, user, payload, student_id)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
     rows = list_assessments_for_student(
         db,
         user.institution_id,
         sid,
         board=board,
         grade=grade,
+        academic_year_id=year.id if year else None,
     )
     return [
         _assessment_out(
@@ -315,14 +340,25 @@ def _access_request_out(db: Session, req: AssessmentAccessRequest) -> Assessment
 @router.get("/assessments/access-requests", response_model=list[AssessmentAccessRequestOut])
 def list_access_requests(
     status_filter: str | None = Query(None, alias="status"),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "tutor")),
 ) -> list[AssessmentAccessRequestOut]:
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
     q = (
         db.query(AssessmentAccessRequest)
         .join(Assessment, Assessment.id == AssessmentAccessRequest.assessment_id)
         .filter(Assessment.institution_id == user.institution_id)
     )
+    if year:
+        q = q.filter(Assessment.academic_year_id == year.id)
     if status_filter:
         q = q.filter(AssessmentAccessRequest.status == status_filter)
     rows = q.order_by(AssessmentAccessRequest.requested_at.desc()).all()
@@ -504,9 +540,14 @@ def create_assessment(
         user.institution_id,
         academic_year_id=body.academic_year_id,
         academic_year=body.academic_year,
+        default_to_current=True,
     )
     if not year:
-        year = enr_svc.ensure_academic_year(db, user.institution_id, "2025-26", make_current=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Academic year is required. Create an academic year first.",
+        )
+    subjects = normalize_subjects(body.subjects, body.subject)
     assessment = Assessment(
         id=f"ta-{uuid.uuid4().hex[:8]}",
         institution_id=user.institution_id,
@@ -514,7 +555,8 @@ def create_assessment(
         title=body.title,
         board=body.board,
         grade=body.grade,
-        subject=body.subject,
+        subject=primary_subject(subjects, body.subject),
+        subjects=subjects_json(subjects),
         scope=body.scope,
         mode=body.mode,
         batch_name=body.batch_name,
