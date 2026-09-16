@@ -20,6 +20,7 @@ def download_students_csv(
     center_id: str | None = Query(None),
     academic_year_id: str | None = Query(None),
     academic_year: str | None = Query(None),
+    search: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin", "tutor")),
     payload: dict = Depends(get_token_payload),
@@ -41,6 +42,7 @@ def download_students_csv(
         center_id=center_id,
         center_ids=scope,
         academic_year_id=year.id if year else None,
+        search=search,
     )
 
 

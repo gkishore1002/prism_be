@@ -1,9 +1,10 @@
 """Upload and serve question stem / option images."""
 
 from fastapi import APIRouter, Depends, File, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_user, require_roles
+from app.core.deps import get_current_user, get_db, require_roles
 from app.core.routing import CamelCaseAPIRoute
 from app.models.user import User
 from app.schemas import QuestionMediaOut
@@ -15,9 +16,11 @@ router = APIRouter(tags=["question-media"], route_class=CamelCaseAPIRoute)
 @router.post("/question-media", response_model=QuestionMediaOut)
 async def upload_question_media(
     file: UploadFile = File(...),
+    db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> QuestionMediaOut:
-    key = await media_svc.save_upload(user.institution_id, file)
+    key = await media_svc.save_upload(db, user.institution_id, file)
+    db.commit()
     return QuestionMediaOut(key=key, url=media_svc.media_url_for_key(key) or "")
 
 
@@ -25,14 +28,13 @@ async def upload_question_media(
 def get_question_media(
     institution_id: str,
     filename: str,
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> FileResponse:
+) -> Response:
     key = f"{institution_id}/{filename}"
-    media_svc.assert_key_owned(key, user.institution_id)
-    path = media_svc.resolve_media_path(key)
-    media_type = "image/jpeg"
-    if path.suffix == ".png":
-        media_type = "image/png"
-    elif path.suffix == ".webp":
-        media_type = "image/webp"
-    return FileResponse(path, media_type=media_type)
+    data, media_type = media_svc.load_media(db, key, user.institution_id)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )

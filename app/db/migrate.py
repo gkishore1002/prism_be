@@ -1042,6 +1042,30 @@ def ensure_question_image_columns(engine: Engine, schema: str | None = None) -> 
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} VARCHAR(255)"))
 
 
+def ensure_question_media_files(engine: Engine, schema: str | None = None) -> None:
+    """Store question images in the database so they survive ephemeral disks."""
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("question_media_files", schema=schema_kw):
+        return
+    table = f"{schema}.question_media_files" if schema_kw else "question_media_files"
+    blob_type = "BYTEA" if engine.dialect.name == "postgresql" else "BLOB"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    key VARCHAR(255) PRIMARY KEY,
+                    institution_id VARCHAR(32) NOT NULL,
+                    content_type VARCHAR(64) NOT NULL DEFAULT 'image/jpeg',
+                    data {blob_type} NOT NULL,
+                    created_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+
+
 def ensure_multi_subjects_columns(engine: Engine, schema: str | None = None) -> None:
     """Add subjects JSON columns on batches, question_papers, and assessments."""
     inspector = inspect(engine)
@@ -1127,6 +1151,10 @@ def run_migrations(engine: Engine) -> None:
     ensure_question_image_columns(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_question_image_columns)
+
+    ensure_question_media_files(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_question_media_files)
 
     ensure_multi_subjects_columns(engine)
     if is_multi_schema_enabled():

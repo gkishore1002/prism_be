@@ -16,14 +16,23 @@ from app.services.csc_eligibility import days_until_csc_disable
 from app.services.institution_policies import get_csc_policy
 
 
+def _cell(value) -> str:
+    """Normalize cell text so Excel does not treat embedded newlines as row breaks."""
+    if value is None:
+        return ""
+    text = str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    return text
+
+
 def _csv_response(rows: list[list], headers: list[str], filename: str) -> StreamingResponse:
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(headers)
-    writer.writerows(rows)
-    content = buf.getvalue()
+    # CRLF + UTF-8 BOM so Excel on Windows opens columns/rows correctly.
+    writer = csv.writer(buf, lineterminator="\r\n", quoting=csv.QUOTE_MINIMAL)
+    writer.writerow([_cell(h) for h in headers])
+    writer.writerows([[_cell(v) for v in row] for row in rows])
+    content = "\ufeff" + buf.getvalue()
     return StreamingResponse(
-        iter([content]),
+        iter([content.encode("utf-8")]),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -37,18 +46,34 @@ def _filter_by_center(students: list, center_id: str | None = None, center_ids: 
     return students
 
 
+def _format_center_label(center: Center | None, fallback: str = "") -> str:
+    if not center:
+        return fallback
+    name = (center.name or "").strip()
+    city = (center.city or "").strip()
+    if not city:
+        return name or fallback
+    if city.lower() in name.lower():
+        return name
+    return f"{name} · {city}"
+
+
 def export_students_csv(
     db: Session,
     institution_id: str,
     center_id: str | None = None,
     center_ids: list[str] | None = None,
     academic_year_id: str | None = None,
+    search: str | None = None,
 ) -> StreamingResponse:
+    from app.models.content import Batch, BatchStudent
+    from app.models.enrollment import StudentEnrollment
     from app.services.student_master import apply_student_master_filters, student_master_base_query
 
     q = student_master_base_query(db, institution_id)
     q = apply_student_master_filters(
         q,
+        search=search,
         center=center_id,
         academic_year_id=academic_year_id,
         institution_id=institution_id,
@@ -57,18 +82,50 @@ def export_students_csv(
     students = q.all()
     if center_id is None and center_ids is not None:
         students = [s for s in students if s.center_id in center_ids]
-    centers = {c.id: c.name for c in db.query(Center).filter(Center.institution_id == institution_id).all()}
+
+    centers = {
+        c.id: c for c in db.query(Center).filter(Center.institution_id == institution_id).all()
+    }
+    batch_name_by_id = {
+        b.id: b.name
+        for b in db.query(Batch).filter(Batch.institution_id == institution_id).all()
+    }
+    memberships_by_student: dict[str, list[str]] = {}
+    student_ids = [s.id for s in students]
+    if student_ids:
+        for row in (
+            db.query(BatchStudent).filter(BatchStudent.student_id.in_(student_ids)).all()
+        ):
+            memberships_by_student.setdefault(row.student_id, []).append(row.batch_id)
+
+    enrollment_by_student: dict[str, StudentEnrollment] = {}
+    if academic_year_id:
+        for enr in (
+            db.query(StudentEnrollment)
+            .filter(StudentEnrollment.academic_year_id == academic_year_id)
+            .all()
+        ):
+            enrollment_by_student[enr.student_id] = enr
+
     rows = []
     for s in students:
+        batch_ids = memberships_by_student.get(s.id, [])
+        batch_names = [batch_name_by_id[bid] for bid in batch_ids if bid in batch_name_by_id]
+        batch_label = ", ".join(batch_names) if batch_names else (s.batch or "")
+        enr = enrollment_by_student.get(s.id)
+        board = enr.board if enr else s.board
+        grade = enr.grade if enr else s.grade
+        center = centers.get(s.center_id) if s.center_id else None
         rows.append([
-            s.id,
             s.user.name,
-            s.user.email,
-            s.board,
-            s.grade,
-            s.batch,
-            centers.get(s.center_id, s.center_id or ""),
+            s.school_name or "",
+            board,
+            grade,
+            batch_label,
+            _format_center_label(center, s.center_id or ""),
             s.status,
+            s.user.email,
+            s.id,
             s.disable_reason or "",
             s.last_csc_interaction_at or "",
             days_until_csc_disable(s, db=db) if s.last_csc_interaction_at else "",
@@ -76,7 +133,20 @@ def export_students_csv(
     today = date.today().isoformat()
     return _csv_response(
         rows,
-        ["Student ID", "Name", "Email", "Board", "Grade", "Batch", "Center", "Status", "Disable Reason", "Last CSC Visit", "Days Until Disable"],
+        [
+            "Name",
+            "School",
+            "Board",
+            "Grade",
+            "Batch",
+            "Branch",
+            "Status",
+            "Email",
+            "Student ID",
+            "Disable Reason",
+            "Last CSC Visit",
+            "Days Until Disable",
+        ],
         f"students-{today}.csv",
     )
 

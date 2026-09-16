@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -93,3 +93,15 @@ class Question(Base):
     option_d_image_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     topic_rel: Mapped["Topic"] = relationship(back_populates="questions")
+
+
+class QuestionMediaFile(Base):
+    """Durable stem/option image bytes (survives container and Render disk resets)."""
+
+    __tablename__ = "question_media_files"
+
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(String(32), index=True)
+    content_type: Mapped[str] = mapped_column(String(64), default="image/jpeg")
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[str] = mapped_column(String(32), default="")

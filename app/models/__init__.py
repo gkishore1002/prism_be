@@ -1,4 +1,4 @@
-from app.models.academic import Board, Chapter, Grade, Question, Subject, Topic
+from app.models.academic import Board, Chapter, Grade, Question, QuestionMediaFile, Subject, Topic
 from app.models.assessment import (
     Assessment,
     AssessmentStudentReport,
@@ -33,6 +33,7 @@ __all__ = [
     "Chapter",
     "Topic",
     "Question",
+    "QuestionMediaFile",
     "Batch",
     "BatchStudent",
     "QuestionPaper",
