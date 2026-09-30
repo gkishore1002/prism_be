@@ -243,3 +243,171 @@ def export_centers_csv(db: Session, institution_id: str) -> StreamingResponse:
         ["Center ID", "Name", "City", "Status", "Students"],
         f"centers-{today}.csv",
     )
+
+
+def _phone_from_staff_email(email: str) -> str:
+    from app.services.user_credentials import PHONE_EMAIL_DOMAIN
+
+    local, _, domain = (email or "").partition("@")
+    if domain.lower() == PHONE_EMAIL_DOMAIN and local.isdigit():
+        return local
+    return ""
+
+
+def export_staff_csv(
+    db: Session,
+    institution_id: str,
+    *,
+    actor: User,
+    role: str,
+    center_id: str | None = None,
+    academic_year_id: str | None = None,
+    search: str | None = None,
+) -> StreamingResponse:
+    """Export staff for the current year scope (same filters as Staff list)."""
+    from sqlalchemy import or_
+
+    from app.services import enrollments as enr_svc
+    from app.services import staff_assignments as sa_svc
+    from app.services.branch_access import (
+        assigned_center_ids,
+        get_accessible_center_ids,
+        is_organization_owner,
+        resolve_branch_filter,
+        user_matches_center_scope,
+    )
+    from app.services.user_roles import is_tutor_account, parse_roles, role_filter
+
+    year = None
+    if academic_year_id:
+        year = enr_svc.resolve_academic_year(
+            db,
+            institution_id,
+            academic_year_id=academic_year_id,
+            required=True,
+            default_to_current=False,
+        )
+
+    staff_rows = (
+        db.query(User)
+        .filter(
+            User.institution_id == institution_id,
+            or_(role_filter("admin"), role_filter("tutor")),
+        )
+        .order_by(User.name)
+        .all()
+    )
+
+    accessible = get_accessible_center_ids(db, actor, role)
+    if accessible is not None:
+        if not accessible:
+            today = date.today().isoformat()
+            return _csv_response([], _staff_export_headers(), f"staff-{today}.csv")
+        allowed = set(accessible)
+        filtered: list[User] = []
+        for row in staff_rows:
+            if is_organization_owner(row, "admin"):
+                continue
+            staff_centers = assigned_center_ids(db, row.id)
+            if not staff_centers:
+                if is_tutor_account(row):
+                    filtered.append(row)
+                continue
+            if allowed.intersection(staff_centers):
+                filtered.append(row)
+        staff_rows = filtered
+
+    scope = resolve_branch_filter(db, actor, role, center_id)
+    staff_rows = [row for row in staff_rows if user_matches_center_scope(db, row, scope)]
+
+    needle = (search or "").strip().casefold()
+    if needle:
+        staff_rows = [
+            row
+            for row in staff_rows
+            if needle in (row.name or "").casefold() or needle in (row.email or "").casefold()
+        ]
+
+    centers = {
+        c.id: c for c in db.query(Center).filter(Center.institution_id == institution_id).all()
+    }
+    year_name = year.name if year else ""
+    assignments: dict[str, object] = {}
+    if year:
+        assignments = {
+            a.staff_id: a
+            for a in sa_svc.list_assignments_for_year(
+                db,
+                institution_id,
+                year.id,
+                center_id=center_id if center_id else None,
+            )
+        }
+
+    rows: list[list] = []
+    for user in staff_rows:
+        assignment = assignments.get(user.id) if year else None
+        if year and not assignment:
+            continue
+        if center_id and assignment is not None and getattr(assignment, "center_id", None) != center_id:
+            continue
+
+        is_owner = bool(getattr(user, "is_owner", False))
+        roles = parse_roles(user)
+        role_labels: list[str] = []
+        if is_owner:
+            role_labels.append("organization_owner")
+        if "admin" in roles:
+            role_labels.append("branch_admin")
+        if "tutor" in roles:
+            role_labels.append("tutor")
+
+        portal_ids = assigned_center_ids(db, user.id)
+        portal_labels = [
+            _format_center_label(centers.get(cid), cid) for cid in portal_ids
+        ]
+        assign_center_id = getattr(assignment, "center_id", None) if assignment else None
+        assign_center = (
+            _format_center_label(centers.get(assign_center_id), assign_center_id or "")
+            if assign_center_id
+            else ""
+        )
+
+        rows.append(
+            [
+                user.name,
+                _phone_from_staff_email(user.email),
+                user.email,
+                "yes" if is_owner else "no",
+                "yes" if "admin" in roles else "no",
+                "yes" if "tutor" in roles else "no",
+                "; ".join(role_labels),
+                "; ".join(portal_labels),
+                year_name or (getattr(assignment, "academic_year_id", "") if assignment else ""),
+                assign_center,
+                getattr(assignment, "status", "") if assignment else "",
+                getattr(assignment, "start_date", "") if assignment else "",
+                user.id,
+            ]
+        )
+
+    today = date.today().isoformat()
+    return _csv_response(rows, _staff_export_headers(), f"staff-{today}.csv")
+
+
+def _staff_export_headers() -> list[str]:
+    return [
+        "Name",
+        "Phone",
+        "Email",
+        "Org Owner",
+        "Branch Admin",
+        "Tutor",
+        "Roles",
+        "Portal Branches",
+        "Academic Year",
+        "Year Center",
+        "Assignment Status",
+        "Assignment Start",
+        "Staff ID",
+    ]

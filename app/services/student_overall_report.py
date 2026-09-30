@@ -1,6 +1,6 @@
 """Persisted overall performance insights for a student.
 
-AI generation runs only when an assessment is submitted or marked completed.
+AI generation runs only when an assessment is submitted/completed or marks are saved.
 Overall-report reads use the stored summaries and never call Vertex.
 """
 from __future__ import annotations

@@ -218,15 +218,23 @@ def update_syllabus_book_outline(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("tutor", "admin")),
 ) -> SyllabusBookOut:
-    """Save user-edited chapters/topics without syncing curriculum yet."""
+    """Save user-edited chapters/topics and sync any new topics into curriculum."""
     book = _require_analyzed_book(db, book_id, user.institution_id)
     if not body.chapters:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Add at least one chapter before saving the outline.",
         )
-    books_svc.save_book_outline(
+    outline = books_svc.save_book_outline(
         db, book, [chapter.model_dump() for chapter in body.chapters]
+    )
+    books_svc.persist_outline_to_curriculum(
+        db,
+        user.institution_id,
+        book.board,
+        book.grade,
+        book.subject,
+        outline["chapters"],
     )
     db.commit()
     db.refresh(book)

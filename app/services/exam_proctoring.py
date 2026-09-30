@@ -247,9 +247,13 @@ def finalize_attempt_as_attended(
         build_and_store_assessment_report(
             db, assessment.id, profile.id, commit=False, force=True, use_ai=True
         )
+        from app.services.student_genome_report import build_and_store_genome_report
         from app.services.student_overall_report import build_and_store_overall_report
 
         build_and_store_overall_report(db, profile.id, use_ai=True, commit=False)
+        build_and_store_genome_report(
+            db, assessment.institution_id, profile.id, use_ai=True, commit=False
+        )
     except Exception:
         logger.exception(
             "post_submit_report_failed assessment=%s student=%s",

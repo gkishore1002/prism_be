@@ -476,7 +476,8 @@ def list_assessment_reports(
 
 
 def refresh_reports_for_assessment(db: Session, assessment_id: str) -> list[str]:
-    """Force AI regenerate for every attended student on this assessment + overall insights."""
+    """Force AI regenerate for every attended student on this assessment + overall/genome insights."""
+    from app.services.student_genome_report import build_and_store_genome_report
     from app.services.student_overall_report import build_and_store_overall_report
 
     assessment = db.get(Assessment, assessment_id)
@@ -500,6 +501,13 @@ def refresh_reports_for_assessment(db: Session, assessment_id: str) -> list[str]
                 db, assessment_id, student_id, force=True, use_ai=True, commit=False
             )
             build_and_store_overall_report(db, student_id, use_ai=True, commit=False)
+            build_and_store_genome_report(
+                db,
+                assessment.institution_id,
+                student_id,
+                use_ai=True,
+                commit=False,
+            )
             refreshed.append(student_id)
         except Exception:  # noqa: BLE001
             logger.exception(

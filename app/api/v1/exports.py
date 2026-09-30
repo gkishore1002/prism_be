@@ -9,6 +9,7 @@ from app.services.exports import (
     export_centers_csv,
     export_csc_compliance_csv,
     export_reassignment_csv,
+    export_staff_csv,
     export_students_csv,
 )
 
@@ -41,6 +42,37 @@ def download_students_csv(
         user.institution_id,
         center_id=center_id,
         center_ids=scope,
+        academic_year_id=year.id if year else None,
+        search=search,
+    )
+
+
+@router.get("/staff.csv")
+def download_staff_csv(
+    center_id: str | None = Query(None),
+    academic_year_id: str | None = Query(None),
+    academic_year: str | None = Query(None),
+    search: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+    payload: dict = Depends(get_token_payload),
+):
+    from app.services import enrollments as enr_svc
+
+    role = get_effective_role(payload, user)
+    year = enr_svc.resolve_academic_year(
+        db,
+        user.institution_id,
+        academic_year_id=academic_year_id,
+        academic_year=academic_year,
+        default_to_current=False,
+    )
+    return export_staff_csv(
+        db,
+        user.institution_id,
+        actor=user,
+        role=role,
+        center_id=center_id,
         academic_year_id=year.id if year else None,
         search=search,
     )

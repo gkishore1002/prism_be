@@ -46,6 +46,7 @@ class QuestionPaper(Base):
     created_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     source: Mapped[str] = mapped_column(String(16), default="upload")
     parent_paper_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="published")  # draft | published
 
 
 class SyllabusBook(Base):

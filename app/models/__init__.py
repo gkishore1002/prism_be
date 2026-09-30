@@ -5,11 +5,12 @@ from app.models.assessment import (
     AssessmentSubmission,
     ExamSession,
     ExamViolation,
+    StudentGenomeReport,
     StudentOverallReport,
 )
 from app.models.content import Batch, BatchStudent, QuestionPaper, SyllabusBook
 from app.models.institution import Center, Institution
-from app.models.marks import MarksEntry
+from app.models.marks import MarksDraft, MarksEntry
 from app.models.notification import Notification
 from app.models.tutor_settings import TutorDashboardSetting
 from app.models.csc import AssessmentAccessRequest, ReportCollectionLog
@@ -44,7 +45,9 @@ __all__ = [
     "ExamViolation",
     "AssessmentStudentReport",
     "StudentOverallReport",
+    "StudentGenomeReport",
     "MarksEntry",
+    "MarksDraft",
     "Notification",
     "TutorDashboardSetting",
     "AssessmentAccessRequest",

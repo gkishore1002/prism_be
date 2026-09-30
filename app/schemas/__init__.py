@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import EmailStr, Field
+from pydantic import EmailStr, Field, field_validator
 
 from app.schemas.base import CamelModel
 
@@ -368,12 +368,38 @@ class StudentBulkRow(CamelModel):
 class StaffBulkRow(CamelModel):
     name: str
     phone: str = Field(min_length=10, max_length=15)
-    password: str | None = Field(default=None, min_length=8, max_length=128)
+    password: str | None = Field(default=None, max_length=128)
     is_owner: bool = False
     is_branch_admin: bool = False
     is_tutor: bool = False
     center_ids: list[str] = Field(default_factory=list)
     center_names: list[str] = Field(default_factory=list)
+    academic_year: str = ""
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _blank_password_to_none(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def _password_min_length(cls, value: str | None) -> str | None:
+        if value is not None and len(value) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return value
+
+    @field_validator("academic_year", mode="before")
+    @classmethod
+    def _blank_academic_year(cls, value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class BulkImportRowResult(CamelModel):
@@ -396,6 +422,7 @@ class StudentBulkImportIn(CamelModel):
 
 class StaffBulkImportIn(CamelModel):
     rows: list[StaffBulkRow]
+    academic_year_id: str | None = None
 
 
 class StudentUpdate(CamelModel):
@@ -646,6 +673,7 @@ class QuestionPaperOut(CamelModel):
     created_by: str | None = None
     source: Literal["upload", "custom", "manual"]
     parent_paper_id: str | None = None
+    status: Literal["draft", "published"] = "published"
 
 
 class QuestionPaperCreate(CamelModel):
@@ -657,12 +685,15 @@ class QuestionPaperCreate(CamelModel):
     question_ids: list[str]
     source: Literal["upload", "custom", "manual"] = "upload"
     parent_paper_id: str | None = None
+    status: Literal["draft", "published"] = "published"
 
 
 class QuestionPaperBulkCreate(CamelModel):
     name: str
     questions: list[QuestionCreate]
     source: Literal["upload", "manual"] = "manual"
+    status: Literal["draft", "published"] = "published"
+    paper_id: str | None = None
 
 
 class CustomPaperCreate(CamelModel):
@@ -674,6 +705,8 @@ class CustomPaperCreate(CamelModel):
 class QuestionPaperUpdate(CamelModel):
     name: str | None = None
     question_ids: list[str] | None = None
+    questions: list[QuestionCreate] | None = None
+    status: Literal["draft", "published"] | None = None
 
 
 class SyllabusBookOut(CamelModel):

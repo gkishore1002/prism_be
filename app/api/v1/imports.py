@@ -47,12 +47,20 @@ def download_students_import_template(
 
 @router.get("/staff-template.csv")
 def download_staff_import_template(
+    db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
     payload: dict = Depends(get_token_payload),
 ) -> StreamingResponse:
     role = get_effective_role(payload, user)
     include_owner = has_tenant_management_access(user, role)
-    headers, rows = staff_import_template_csv(include_org_owner=include_owner)
+    from app.services.enrollments import get_current_academic_year
+
+    current = get_current_academic_year(db, user.institution_id)
+    year_name = current.name if current else "2025-26"
+    headers, rows = staff_import_template_csv(
+        include_org_owner=include_owner,
+        academic_year=year_name,
+    )
     return _csv_download(headers, rows, "staff-import-template.csv")
 
 
@@ -97,4 +105,5 @@ def bulk_import_staff(
         role=role,
         rows=body.rows,
         allow_org_owner=allow_org_owner,
+        academic_year_id=body.academic_year_id,
     )

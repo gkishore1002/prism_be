@@ -9,6 +9,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, get_effective_role, get_token_payload, require_roles
+from app.core.pagination import PaginatedOut, paginate_list
 from app.core.routing import CamelCaseAPIRoute
 from app.core.security import hash_password
 from app.models.enrollment import AcademicYear
@@ -113,14 +114,17 @@ def _assert_create_permissions(body: StaffCreate, actor: User, role: str) -> Non
         require_tenant_management_access(actor, role)
 
 
-@router.get("", response_model=list[StaffOut])
+@router.get("", response_model=PaginatedOut[StaffOut])
 def list_staff(
     center_id: str | None = Query(None),
     academic_year_id: str | None = Query(None),
+    search: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
     payload: dict = Depends(get_token_payload),
-) -> list[StaffOut]:
+) -> PaginatedOut[StaffOut]:
     from app.services.branch_access import (
         get_accessible_center_ids,
         is_organization_owner,
@@ -151,7 +155,7 @@ def list_staff(
     accessible = get_accessible_center_ids(db, user, role)
     if accessible is not None:
         if not accessible:
-            return []
+            return PaginatedOut(items=[], total=0, page=page, limit=limit, pages=1)
         allowed = set(accessible)
         filtered: list[User] = []
         for row in rows:
@@ -168,8 +172,17 @@ def list_staff(
     scope = resolve_branch_filter(db, user, role, center_id)
     rows = [row for row in rows if user_matches_center_scope(db, row, scope)]
 
+    needle = (search or "").strip().casefold()
+    if needle:
+        rows = [
+            row
+            for row in rows
+            if needle in (row.name or "").casefold() or needle in (row.email or "").casefold()
+        ]
+
     if not year:
-        return [_staff_out(db, row) for row in rows]
+        out = [_staff_out(db, row) for row in rows]
+        return paginate_list(out, page=page, limit=limit)
 
     assignments = {
         a.staff_id: a
@@ -188,7 +201,7 @@ def list_staff(
         if center_id and assignment.center_id != center_id:
             continue
         out.append(_staff_out(db, row, assignment=assignment, academic_year_id=year.id))
-    return out
+    return paginate_list(out, page=page, limit=limit)
 
 
 @router.post("", response_model=StaffOut, status_code=status.HTTP_201_CREATED)

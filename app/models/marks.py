@@ -26,3 +26,22 @@ class MarksEntry(Base):
     conducted_on: Mapped[str] = mapped_column(String(16))
     saved_at: Mapped[str] = mapped_column(String(32))
     created_by_user_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class MarksDraft(Base):
+    """In-progress marks spreadsheet saved for later (Gmail-style draft)."""
+
+    __tablename__ = "marks_drafts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()))
+    created_by_user_id: Mapped[str] = mapped_column(String(32), index=True)
+    batch_id: Mapped[str | None] = mapped_column(ForeignKey("batches.id"), nullable=True)
+    batch_name: Mapped[str] = mapped_column(String(128), default="")
+    assessment_title: Mapped[str] = mapped_column(String(255), default="")
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="manual")  # manual | upload
+    payload: Mapped[str] = mapped_column(Text, default="{}")  # JSON: columns, marks, studentIds
+    status: Mapped[str] = mapped_column(String(16), default="draft")
+    created_at: Mapped[str] = mapped_column(String(32), default="")
+    updated_at: Mapped[str] = mapped_column(String(32), default="")

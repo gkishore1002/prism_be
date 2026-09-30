@@ -197,21 +197,67 @@ def persist_outline_to_curriculum(
     subject: str,
     chapters: list[dict],
 ) -> int:
+    """Create missing board/grade/subject/chapter/topic rows. Returns newly created topic count."""
     from app.api.v1.curriculum import _find_or_create_topic
+    from app.models.academic import Board, Chapter, Grade, Subject, Topic
+
+    board_name = (board or "").strip()
+    grade_name = normalize_grade(grade)
+    subject_name = (subject or "").strip()
+
+    def _topic_exists(chapter_name: str, topic_name: str) -> bool:
+        board_row = (
+            db.query(Board)
+            .filter(Board.institution_id == institution_id, Board.name == board_name)
+            .first()
+        )
+        if not board_row:
+            return False
+        grade_row = (
+            db.query(Grade).filter(Grade.board_id == board_row.id, Grade.name == grade_name).first()
+        )
+        if not grade_row:
+            return False
+        subject_row = (
+            db.query(Subject)
+            .filter(Subject.grade_id == grade_row.id, Subject.name == subject_name)
+            .first()
+        )
+        if not subject_row:
+            return False
+        chapter_label = (chapter_name or "").strip() or subject_name
+        chapter_row = (
+            db.query(Chapter)
+            .filter(Chapter.subject_id == subject_row.id, Chapter.name == chapter_label)
+            .first()
+        )
+        if not chapter_row:
+            return False
+        return (
+            db.query(Topic.id)
+            .filter(Topic.chapter_id == chapter_row.id, Topic.name == topic_name)
+            .first()
+            is not None
+        )
 
     added = 0
     for chapter in normalize_outline_chapters(chapters):
         title = chapter["title"]
         topics = chapter.get("topics") or []
-        if not topics:
-            _find_or_create_topic(db, institution_id, board, grade, subject, title, chapter_name=title)
-            added += 1
-            continue
-        for name in topics:
+        names = topics if topics else [title]
+        for name in names:
+            existed = _topic_exists(title, name)
             _find_or_create_topic(
-                db, institution_id, board, grade, subject, name, chapter_name=title
+                db,
+                institution_id,
+                board_name,
+                grade_name,
+                subject_name,
+                name,
+                chapter_name=title,
             )
-            added += 1
+            if not existed:
+                added += 1
     return added
 
 
@@ -225,11 +271,33 @@ def analyze_book(db: Session, book: SyllabusBook, content: bytes, filename: str)
             pdf_bytes=pdf_bytes,
             pdf_text=pdf_text,
         )
-        # Outline is stored for user review/approval. Curriculum sync happens on approve.
         book.analysis_json = json.dumps(outline)
         book.status = "analyzed"
         book.error_message = ""
         db.add(book)
+        db.flush()
+
+        # Auto-sync missing topics into curriculum for this board / grade / subject.
+        chapters = (outline or {}).get("chapters") or []
+        if chapters:
+            try:
+                added = persist_outline_to_curriculum(
+                    db,
+                    book.institution_id,
+                    book.board,
+                    book.grade,
+                    book.subject,
+                    chapters,
+                )
+                logger.info(
+                    "syllabus_book_auto_synced book_id=%s topics_added=%s",
+                    book.id,
+                    added,
+                )
+            except Exception:  # noqa: BLE001
+                # Analysis succeeded; curriculum sync failure should not mark the book failed.
+                logger.exception("syllabus_book_auto_sync_failed book_id=%s", book.id)
+
         db.commit()
     except Exception as exc:  # noqa: BLE001
         logger.exception("syllabus_book_extract_failed book_id=%s", book.id)

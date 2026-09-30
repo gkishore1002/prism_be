@@ -74,7 +74,7 @@ def _refresh_reports_after_assessment_update(
     schema_name: str | None,
     institution_id: str,
 ) -> None:
-    """Background: regenerate stored assessment + overall AI reports after mark completed."""
+    """Background: regenerate stored assessment + overall + genome AI reports after mark completed."""
     tokens = set_tenant_context(schema_name=schema_name or "public", institution_id=institution_id)
     db = open_tenant_db(schema_name)
     try:

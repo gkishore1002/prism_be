@@ -136,3 +136,17 @@ class StudentOverallReport(Base):
     summary_ta: Mapped[str] = mapped_column(Text, default="")
     summary_source: Mapped[str] = mapped_column(String(16), default="rule-based")
     computed_at: Mapped[str] = mapped_column(String(32), default="")
+
+
+class StudentGenomeReport(Base):
+    """Persisted Learning Genome AI narrative — refreshed when marks/assessments update."""
+
+    __tablename__ = "student_genome_reports"
+
+    student_id: Mapped[str] = mapped_column(
+        ForeignKey("student_profiles.id"), primary_key=True
+    )
+    narrative: Mapped[str] = mapped_column(Text, default="")
+    narrative_ta: Mapped[str] = mapped_column(Text, default="")
+    narrative_source: Mapped[str] = mapped_column(String(16), default="rule-based")
+    computed_at: Mapped[str] = mapped_column(String(32), default="")

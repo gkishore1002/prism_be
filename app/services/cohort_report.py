@@ -698,26 +698,21 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         batch_id=batch.id if batch else None,
     )
 
-    from app.services import vertex_summary as vertex_svc
-
-    narrative_context = {
-        "studentName": profile.user.name,
-        "batchLabel": f"{profile.batch} · {profile.board} · {profile.grade}" if profile.batch else None,
-        "totalStudents": max(total, 1),
-        "profile": genome,
-    }
-    ai_narrative, ai_narrative_ta = vertex_svc.generate_pair_parallel(
-        vertex_svc.generate_student_genome_narrative,
-        vertex_svc.generate_student_genome_narrative_ta,
-        narrative_context,
+    topic_mastery, knowledge_summary = _student_knowledge_layer(
+        db, institution_id, student_id, profile.user.name
     )
+
+    # Narratives are generated on marks/assessment write jobs — never call Vertex on open.
+    from app.services.student_genome_report import get_stored_genome_narratives
+
+    stored_en, stored_ta, narrative_source = get_stored_genome_narratives(db, student_id)
     rule_narrative_ta = (
         f"{profile.user.name} அவர்களின் ஒட்டுமொத்த மதிப்பெண் {genome.get('overall', 0)}% ஆகும். "
         f"வகுப்பில் #{rank} இடம். விரிவான பகுப்பாய்வுக்கு CSC மையத்தை அணுகவும்."
     )
-
-    topic_mastery, knowledge_summary = _student_knowledge_layer(
-        db, institution_id, student_id, profile.user.name
+    rule_narrative = (
+        f"{profile.user.name}'s Learning Genome overall score is {genome.get('overall', 0)}%. "
+        f"Class rank #{rank}."
     )
 
     return {
@@ -726,9 +721,9 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         "totalStudents": max(total, 1),
         "batchLabel": f"{profile.batch} · {profile.board} · {profile.grade}" if profile.batch else None,
         "source": "live",
-        "narrative": ai_narrative,
-        "narrativeTa": ai_narrative_ta or rule_narrative_ta,
-        "narrativeSource": "vertex" if ai_narrative else "rule-based",
+        "narrative": stored_en or rule_narrative,
+        "narrativeTa": stored_ta or rule_narrative_ta,
+        "narrativeSource": narrative_source if stored_en else "rule-based",
         "topicMastery": topic_mastery,
         "knowledgeSummary": knowledge_summary,
     }

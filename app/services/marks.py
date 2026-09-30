@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ from statistics import mean
 from sqlalchemy.orm import Session
 
 from app.models.content import Batch
-from app.models.marks import MarksEntry
+from app.models.marks import MarksDraft, MarksEntry
 from app.models.user import StudentProfile, User
 
 
@@ -458,3 +459,186 @@ def export_marks_csv(
         if batch:
             slug = _slugify(batch.name)
     return output.getvalue(), f"prism-marks-{slug}.csv"
+
+
+def _draft_dict(db: Session, row: MarksDraft) -> dict:
+    try:
+        payload = json.loads(row.payload or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    batch_name = row.batch_name
+    if row.batch_id and not batch_name:
+        batch = db.get(Batch, row.batch_id)
+        batch_name = batch.name if batch else ""
+    return {
+        "id": row.id,
+        "batchId": row.batch_id,
+        "batch": batch_name,
+        "assessmentTitle": row.assessment_title,
+        "description": row.description,
+        "source": row.source,
+        "status": row.status,
+        "payload": payload,
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+        "createdByUserId": row.created_by_user_id,
+    }
+
+
+def list_marks_drafts(
+    db: Session,
+    institution_id: str,
+    *,
+    user_id: str | None = None,
+    batch_id: str | None = None,
+) -> list[dict]:
+    q = db.query(MarksDraft).filter(
+        MarksDraft.institution_id == institution_id,
+        MarksDraft.status == "draft",
+    )
+    if user_id:
+        q = q.filter(MarksDraft.created_by_user_id == user_id)
+    if batch_id:
+        q = q.filter(MarksDraft.batch_id == batch_id)
+    rows = q.order_by(MarksDraft.updated_at.desc()).all()
+    return [_draft_dict(db, row) for row in rows]
+
+
+def get_marks_draft(
+    db: Session,
+    institution_id: str,
+    draft_id: str,
+    *,
+    user_id: str | None = None,
+) -> dict:
+    row = db.get(MarksDraft, draft_id)
+    if not row or row.institution_id != institution_id or row.status != "draft":
+        raise ValueError("Draft not found")
+    if user_id and row.created_by_user_id != user_id:
+        raise ValueError("Draft not found")
+    return _draft_dict(db, row)
+
+
+def upsert_marks_draft(
+    db: Session,
+    institution_id: str,
+    *,
+    user_id: str,
+    draft_id: str | None,
+    batch_id: str | None,
+    assessment_title: str,
+    description: str | None,
+    source: str,
+    columns: list[dict],
+    marks: dict[str, dict[str, str | float]],
+    student_ids: list[str],
+) -> dict:
+    batch_name = ""
+    if batch_id:
+        batch = db.get(Batch, batch_id)
+        if not batch or batch.institution_id != institution_id:
+            raise ValueError("Batch not found")
+        batch_name = batch.name
+
+    now = _now_iso()
+    payload = json.dumps(
+        {
+            "columns": columns,
+            "marks": marks,
+            "studentIds": student_ids,
+        },
+        separators=(",", ":"),
+    )
+
+    if draft_id:
+        row = db.get(MarksDraft, draft_id)
+        if not row or row.institution_id != institution_id or row.status != "draft":
+            raise ValueError("Draft not found")
+        if row.created_by_user_id != user_id:
+            raise ValueError("Draft not found")
+    else:
+        row = MarksDraft(
+            id=f"md-{uuid.uuid4().hex[:12]}",
+            institution_id=institution_id,
+            created_by_user_id=user_id,
+            status="draft",
+            created_at=now,
+        )
+        db.add(row)
+
+    row.batch_id = batch_id
+    row.batch_name = batch_name
+    row.assessment_title = (assessment_title or "").strip()
+    row.description = (description or "").strip() or None
+    row.source = source if source in ("manual", "upload") else "manual"
+    row.payload = payload
+    row.updated_at = now
+    db.commit()
+    db.refresh(row)
+    return _draft_dict(db, row)
+
+
+def delete_marks_draft(
+    db: Session,
+    institution_id: str,
+    draft_id: str,
+    *,
+    user_id: str,
+) -> None:
+    row = db.get(MarksDraft, draft_id)
+    if not row or row.institution_id != institution_id or row.status != "draft":
+        raise ValueError("Draft not found")
+    if row.created_by_user_id != user_id:
+        raise ValueError("Draft not found")
+    db.delete(row)
+    db.commit()
+
+
+def publish_marks_draft(
+    db: Session,
+    institution_id: str,
+    draft_id: str,
+    *,
+    user_id: str,
+) -> dict:
+    row = db.get(MarksDraft, draft_id)
+    if not row or row.institution_id != institution_id or row.status != "draft":
+        raise ValueError("Draft not found")
+    if row.created_by_user_id != user_id:
+        raise ValueError("Draft not found")
+    try:
+        payload = json.loads(row.payload or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("Draft payload is invalid") from exc
+
+    if not row.batch_id:
+        raise ValueError("Select a batch before publishing")
+    if not (row.assessment_title or "").strip():
+        raise ValueError("Assessment title is required to publish")
+
+    columns = payload.get("columns") or []
+    marks = payload.get("marks") or {}
+    student_ids = payload.get("studentIds") or []
+    if not columns:
+        raise ValueError("Add at least one marks column before publishing")
+    if not student_ids:
+        raise ValueError("No students to publish marks for")
+
+    result = save_marks_bulk(
+        db,
+        institution_id,
+        batch_id=row.batch_id,
+        assessment_title=row.assessment_title,
+        description=row.description,
+        source=row.source,
+        created_by_user_id=user_id,
+        columns=columns,
+        marks=marks,
+        student_ids=student_ids,
+    )
+    # save_marks_bulk already commits; delete draft in a follow-up
+    draft = db.get(MarksDraft, draft_id)
+    if draft:
+        db.delete(draft)
+        db.commit()
+    return result

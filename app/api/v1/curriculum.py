@@ -117,6 +117,17 @@ def _build_curriculum_tree(db: Session, institution_id: str) -> list[CurriculumB
     return result
 
 
+def _fold_name(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def _normalize_grade_label(grade: str) -> str:
+    value = (grade or "").strip()
+    if not value:
+        return value
+    return value if value.lower().startswith("grade") else f"Grade {value}"
+
+
 def _find_or_create_topic(
     db: Session,
     institution_id: str,
@@ -126,50 +137,94 @@ def _find_or_create_topic(
     topic_name: str,
     chapter_name: str | None = None,
 ) -> Topic:
+    board_name = (board or "").strip()
+    grade_name = _normalize_grade_label(grade)
+    subject_name = (subject or "").strip()
+
     board_row = (
         db.query(Board)
-        .filter(Board.institution_id == institution_id, Board.name == board)
+        .filter(Board.institution_id == institution_id, Board.name == board_name)
         .first()
     )
     if not board_row:
+        board_row = next(
+            (
+                row
+                for row in db.query(Board).filter(Board.institution_id == institution_id).all()
+                if _fold_name(row.name) == _fold_name(board_name)
+            ),
+            None,
+        )
+    if not board_row:
         board_row = Board(
-            id=_compact_row_id(db, Board, "board", board),
+            id=_compact_row_id(db, Board, "board", board_name),
             institution_id=institution_id,
-            name=board,
-            code=board.upper(),
+            name=board_name,
+            code=board_name.upper(),
         )
         db.add(board_row)
         db.flush()
 
-    grade_row = db.query(Grade).filter(Grade.board_id == board_row.id, Grade.name == grade).first()
+    grade_row = (
+        db.query(Grade).filter(Grade.board_id == board_row.id, Grade.name == grade_name).first()
+    )
+    if not grade_row:
+        grade_row = next(
+            (
+                row
+                for row in db.query(Grade).filter(Grade.board_id == board_row.id).all()
+                if _normalize_grade_label(row.name).lower() == grade_name.lower()
+            ),
+            None,
+        )
     if not grade_row:
         grade_row = Grade(
-            id=_compact_row_id(db, Grade, "grade", board_row.id, grade),
+            id=_compact_row_id(db, Grade, "grade", board_row.id, grade_name),
             board_id=board_row.id,
-            name=grade,
+            name=grade_name,
             level=8,
         )
         db.add(grade_row)
         db.flush()
 
     subject_row = (
-        db.query(Subject).filter(Subject.grade_id == grade_row.id, Subject.name == subject).first()
+        db.query(Subject)
+        .filter(Subject.grade_id == grade_row.id, Subject.name == subject_name)
+        .first()
     )
     if not subject_row:
+        subject_row = next(
+            (
+                row
+                for row in db.query(Subject).filter(Subject.grade_id == grade_row.id).all()
+                if _fold_name(row.name) == _fold_name(subject_name)
+            ),
+            None,
+        )
+    if not subject_row:
         subject_row = Subject(
-            id=_unique_subject_id(db, grade_row.id, subject),
+            id=_unique_subject_id(db, grade_row.id, subject_name),
             grade_id=grade_row.id,
-            name=subject,
+            name=subject_name,
         )
         db.add(subject_row)
         db.flush()
 
-    chapter_label = (chapter_name or "").strip() or subject
+    chapter_label = (chapter_name or "").strip() or subject_row.name
     chapter_row = (
         db.query(Chapter)
         .filter(Chapter.subject_id == subject_row.id, Chapter.name == chapter_label)
         .first()
     )
+    if not chapter_row:
+        chapter_row = next(
+            (
+                row
+                for row in db.query(Chapter).filter(Chapter.subject_id == subject_row.id).all()
+                if _fold_name(row.name) == _fold_name(chapter_label)
+            ),
+            None,
+        )
     if not chapter_row:
         chapter_row = Chapter(
             id=_compact_row_id(db, Chapter, "ch", subject_row.id, chapter_label),
@@ -183,6 +238,15 @@ def _find_or_create_topic(
     topic_row = (
         db.query(Topic).filter(Topic.chapter_id == chapter_row.id, Topic.name == topic_name).first()
     )
+    if not topic_row:
+        topic_row = next(
+            (
+                row
+                for row in db.query(Topic).filter(Topic.chapter_id == chapter_row.id).all()
+                if _fold_name(row.name) == _fold_name(topic_name)
+            ),
+            None,
+        )
     if not topic_row:
         topic_row = Topic(
             id=_compact_row_id(db, Topic, "top", chapter_row.id, topic_name),

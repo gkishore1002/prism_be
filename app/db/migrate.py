@@ -495,6 +495,29 @@ def ensure_student_overall_reports(engine: Engine, schema: str | None = None) ->
         )
 
 
+def ensure_student_genome_reports(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("student_genome_reports", schema=schema_kw):
+        return
+    students_ref = f"{schema}.student_profiles(id)" if schema_kw else "student_profiles(id)"
+    table = f"{schema}.student_genome_reports" if schema_kw else "student_genome_reports"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    student_id VARCHAR(32) PRIMARY KEY REFERENCES {students_ref},
+                    narrative TEXT NOT NULL DEFAULT '',
+                    narrative_ta TEXT NOT NULL DEFAULT '',
+                    narrative_source VARCHAR(16) NOT NULL DEFAULT 'rule-based',
+                    computed_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+
+
 def _inst_ref(engine: Engine) -> str:
     if engine.dialect.name == "postgresql":
         return "public.institutions(id)"
@@ -1090,12 +1113,64 @@ def ensure_multi_subjects_columns(engine: Engine, schema: str | None = None) -> 
             )
 
 
+def ensure_marks_drafts(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("marks_drafts", schema=schema_kw):
+        return
+    table = "marks_drafts" if not schema_kw else f'"{schema}".marks_drafts'
+    batches_ref = "batches(id)" if not schema_kw else f'"{schema}".batches(id)'
+    with engine.begin() as conn:
+        if schema_kw:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    institution_id VARCHAR(32) NOT NULL,
+                    created_by_user_id VARCHAR(32) NOT NULL,
+                    batch_id VARCHAR(32) REFERENCES {batches_ref},
+                    batch_name VARCHAR(128) NOT NULL DEFAULT '',
+                    assessment_title VARCHAR(255) NOT NULL DEFAULT '',
+                    description TEXT,
+                    source VARCHAR(16) NOT NULL DEFAULT 'manual',
+                    payload TEXT NOT NULL DEFAULT '{{}}',
+                    status VARCHAR(16) NOT NULL DEFAULT 'draft',
+                    created_at VARCHAR(32) NOT NULL DEFAULT '',
+                    updated_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+
+
+def ensure_question_paper_status(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if not inspector.has_table("question_papers", schema=schema_kw):
+        return
+    columns = {c["name"] for c in inspector.get_columns("question_papers", schema=schema_kw)}
+    if "status" in columns:
+        return
+    table = "question_papers" if not schema_kw else f'"{schema}".question_papers'
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"ALTER TABLE {table} ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'published'"
+            )
+        )
+
+
 def run_migrations(engine: Engine) -> None:
     ensure_batch_schedule_timing(engine)
     ensure_assessment_student_reports(engine)
     ensure_student_overall_reports(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_student_overall_reports)
+    ensure_student_genome_reports(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_student_genome_reports)
     ensure_assessment_available_until(engine)
     ensure_assessment_shuffle_questions(engine)
     if is_multi_schema_enabled():
@@ -1159,5 +1234,13 @@ def run_migrations(engine: Engine) -> None:
     ensure_multi_subjects_columns(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_multi_subjects_columns)
+
+    ensure_marks_drafts(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_marks_drafts)
+
+    ensure_question_paper_status(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_question_paper_status)
 
     _ensure_institution_schema_name(engine)

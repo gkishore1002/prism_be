@@ -46,13 +46,18 @@ def _student_template_rows() -> tuple[list[str], list[list[str]]]:
     return headers, sample
 
 
-def _staff_template_rows(*, include_org_owner: bool) -> tuple[list[str], list[list[str]]]:
+def _staff_template_rows(
+    *,
+    include_org_owner: bool,
+    academic_year: str = "2025-26",
+) -> tuple[list[str], list[list[str]]]:
     headers = [
         "name",
         "phone",
         "branch_admin",
         "tutor",
         "branches",
+        "academic_year",
         "password",
     ]
     if include_org_owner:
@@ -63,6 +68,7 @@ def _staff_template_rows(*, include_org_owner: bool) -> tuple[list[str], list[li
         "yes",
         "no",
         "Main Campus",
+        academic_year or "2025-26",
         "",
     ]
     if include_org_owner:
@@ -331,6 +337,7 @@ def _create_staff_row(
     role: str,
     row: StaffBulkRow,
     allow_org_owner: bool,
+    academic_year_id: str | None = None,
 ) -> str:
     if row.is_owner and not allow_org_owner:
         raise ValueError("Organization owner role requires Organization Admin portal")
@@ -343,8 +350,9 @@ def _create_staff_row(
         raise ValueError("Select at least one role: branch_admin, tutor, or org_owner")
 
     center_ids = _resolve_center_ids(db, institution_id, row.center_ids, row.center_names)
-    if center_ids:
-        assert_actor_can_assign_centers(db, actor, role, center_ids)
+    if not center_ids:
+        raise ValueError("At least one branch is required (branches column)")
+    assert_actor_can_assign_centers(db, actor, role, center_ids)
 
     email, password = resolve_user_credentials(phone=row.phone, password=row.password)
     existing = db.query(User).filter(User.email == email).first()
@@ -375,10 +383,40 @@ def _create_staff_row(
         db.add(staff)
         db.flush()
 
-    if center_ids and ("admin" in target_roles or "tutor" in target_roles):
+    if "admin" in target_roles or "tutor" in target_roles:
         from app.services.branch_access import set_user_center_access
 
         set_user_center_access(db, user=staff, center_ids=center_ids, actor=actor)
+
+    # Year-scoped StaffAssignment — required for staff to appear on the Staff page.
+    # Prefer per-row academic_year (CSV), then request-scoped id, then current year.
+    from app.services import enrollments as enr_svc
+    from app.services import staff_assignments as sa_svc
+
+    year_name = (row.academic_year or "").strip()
+    if year_name:
+        year = enr_svc.ensure_academic_year(db, institution_id, year_name, make_current=False)
+        if not enr_svc.get_current_academic_year(db, institution_id):
+            enr_svc.set_current_academic_year(db, institution_id, year.id, commit=False)
+    else:
+        year = enr_svc.resolve_academic_year(
+            db,
+            institution_id,
+            academic_year_id=academic_year_id,
+            required=False,
+            default_to_current=True,
+        )
+    if not year:
+        raise ValueError(
+            "Academic year is required — set academic_year in the CSV or select a year in the header"
+        )
+    sa_svc.ensure_assignment_for_year(
+        db,
+        staff=staff,
+        academic_year_id=year.id,
+        center_id=center_ids[0],
+        status_value="active",
+    )
 
     return staff.id
 
@@ -445,6 +483,7 @@ def import_staff_bulk(
     role: str,
     rows: list[StaffBulkRow],
     allow_org_owner: bool,
+    academic_year_id: str | None = None,
 ) -> BulkImportResult:
     results: list[BulkImportRowResult] = []
     created = 0
@@ -464,6 +503,7 @@ def import_staff_bulk(
                 role=role,
                 row=row,
                 allow_org_owner=allow_org_owner,
+                academic_year_id=academic_year_id,
             )
             db.commit()
             created += 1
@@ -496,5 +536,9 @@ def student_import_template_csv() -> tuple[list[str], list[list[str]]]:
     return _student_template_rows()
 
 
-def staff_import_template_csv(*, include_org_owner: bool) -> tuple[list[str], list[list[str]]]:
-    return _staff_template_rows(include_org_owner=include_org_owner)
+def staff_import_template_csv(
+    *,
+    include_org_owner: bool,
+    academic_year: str = "2025-26",
+) -> tuple[list[str], list[list[str]]]:
+    return _staff_template_rows(include_org_owner=include_org_owner, academic_year=academic_year)
