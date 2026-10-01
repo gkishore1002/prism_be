@@ -174,8 +174,18 @@ def primary_center_id_for_staff(db: Session, staff_id: str) -> str | None:
     return row.center_id if row else None
 
 
+def _fallback_center_id(db: Session, institution_id: str) -> str | None:
+    row = (
+        db.query(Center)
+        .filter(Center.institution_id == institution_id)
+        .order_by(Center.name.asc(), Center.id.asc())
+        .first()
+    )
+    return row.id if row else None
+
+
 def backfill_staff_assignments_for_session(db: Session, institution_id: str | None = None) -> int:
-    """Idempotent: create current-year assignments from UserCenterAccess primary center."""
+    """Idempotent: create current-year assignments from UCA primary center, else HQ/first center."""
     created = 0
     q = db.query(User)
     if institution_id:
@@ -190,10 +200,11 @@ def backfill_staff_assignments_for_session(db: Session, institution_id: str | No
         year = get_current_academic_year(db, inst_id)
         if not year:
             continue
+        fallback_center = _fallback_center_id(db, inst_id)
         for staff in users:
             if get_assignment_for_year(db, staff.id, year.id):
                 continue
-            center_id = primary_center_id_for_staff(db, staff.id)
+            center_id = primary_center_id_for_staff(db, staff.id) or fallback_center
             if not center_id:
                 continue
             ensure_assignment_for_year(

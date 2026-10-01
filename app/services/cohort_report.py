@@ -1,21 +1,30 @@
-"""Build Learning Genome cohort dataset from DB marks, submissions, and profiles."""
+"""Build Learning Genome cohort dataset from DB marks, submissions, and profiles.
+
+Class insights (cohort reports) are persisted per batch and only regenerated when
+marks are published or assessments are scored — same pattern as student overall/genome.
+"""
 
 from __future__ import annotations
 
+import json
+import logging
 from collections import defaultdict
 from datetime import datetime
 from statistics import mean, pstdev
 
 from sqlalchemy.orm import Session
 
-from app.models.assessment import Assessment, AssessmentSubmission
+from app.models.assessment import Assessment, AssessmentSubmission, BatchCohortReport
 from app.models.content import Batch, BatchStudent
+from app.models.marks import MarksEntry
 from app.models.user import StudentProfile
 from app.services.analytics import _batch_student_ids, _students_for_institution, _topic_mastery_rows
 from app.services.marks import marks_for_students
 
+logger = logging.getLogger(__name__)
 
-SUBJECT_CODES = ("TAM", "ENG", "MAT", "SCI", "SOC")
+
+SUBJECT_CODES = ("TAM", "ENG", "MAT", "SCI", "SOC", "OTH")
 
 CLUSTER_LABELS = (
     "High Performers",
@@ -26,20 +35,58 @@ CLUSTER_LABELS = (
     "Needs Immediate Support",
 )
 
+SUBJECT_FULL = {
+    "TAM": "Tamil",
+    "ENG": "English",
+    "MAT": "Mathematics",
+    "SCI": "Science",
+    "SOC": "Social Science",
+    "OTH": "Other",
+}
+
 
 def _subject_code(name: str) -> str:
-    n = name.strip().lower()
-    if "tamil" in n:
+    """Map free-text subject labels onto the Learning Genome subject grid."""
+    from app.services.subjects_list import canonicalize_subject_name
+
+    n = canonicalize_subject_name(name).strip().lower()
+    if not n:
+        return "OTH"
+    if "tamil" in n or n == "tam":
         return "TAM"
-    if "english" in n:
+    if "english" in n or n == "eng":
         return "ENG"
-    if "math" in n:
+    if "math" in n or n in {"mat", "maths"}:
         return "MAT"
-    if "sci" in n:
-        return "SCI"
-    if "social" in n:
+    # Social before Science — "social science" contains "science".
+    if any(
+        token in n
+        for token in ("social", "history", "geography", "civics", "economics", "sst")
+    ):
         return "SOC"
-    return "ENG"
+    if any(
+        token in n
+        for token in (
+            "physics",
+            "chemistry",
+            "biology",
+            "botany",
+            "zoology",
+            "science",
+            "sci",
+            "evs",
+            "environmental",
+        )
+    ):
+        return "SCI"
+    return "OTH"
+
+
+def _subject_display_name(name: str, code: str) -> str:
+    raw = (name or "").strip()
+    if raw:
+        return raw
+    return SUBJECT_FULL.get(code, code)
 
 
 def _parse_date_label(value: str) -> str:
@@ -84,17 +131,22 @@ def _score_events_for_cohort(
     batch: Batch,
     cohort: list[StudentProfile],
 ) -> list[dict]:
+    """Marks (batch-scoped) + attended assessments, with canonical subject names."""
+    from app.services.analytics_recompute import student_score_events
+    from app.services.subjects_list import canonicalize_subject_name
+
     student_ids = [s.id for s in cohort]
     events: list[dict] = []
 
     for row in marks_for_students(db, institution_id, student_ids, batch_id=batch.id):
+        subject = canonicalize_subject_name(row.subject) or row.subject
         events.append(
             {
                 "studentId": row.student_id,
                 "date": row.conducted_on,
                 "dateLabel": _parse_date_label(row.conducted_on),
-                "subject": row.subject,
-                "subjectCode": _subject_code(row.subject),
+                "subject": subject,
+                "subjectCode": _subject_code(subject),
                 "pct": row.percentage,
                 "source": "marks",
                 "title": row.assessment_title,
@@ -104,35 +156,27 @@ def _score_events_for_cohort(
             }
         )
 
-    subs = (
-        db.query(AssessmentSubmission)
-        .filter(AssessmentSubmission.student_id.in_(student_ids))
-        .filter(AssessmentSubmission.status.in_(("attended", "absent")))
-        .order_by(AssessmentSubmission.submitted_at.asc())
-        .all()
-    )
-    for sub in subs:
-        assessment = db.get(Assessment, sub.assessment_id)
-        if not assessment or assessment.institution_id != institution_id:
-            continue
-        pct = round((sub.score / sub.max_score) * 100) if sub.max_score else 0
-        events.append(
-            {
-                "studentId": sub.student_id,
-                "date": sub.submitted_at or "",
-                "dateLabel": _parse_date_label(sub.submitted_at or ""),
-                "subject": assessment.subject,
-                "subjectCode": _subject_code(assessment.subject),
-                "pct": pct,
-                "source": "assessment",
-                "title": assessment.title,
-                "assessmentTitle": assessment.title,
-                "scored": float(sub.score),
-                "maxMarks": int(sub.max_score),
-                "assessmentId": assessment.id,
-                "sessionId": assessment.id,
-            }
-        )
+    for sid in student_ids:
+        for event in student_score_events(db, institution_id, sid):
+            if event.get("source") != "assessment":
+                continue
+            subject = event["subject"]
+            events.append(
+                {
+                    "studentId": sid,
+                    "date": event["date"],
+                    "dateLabel": _parse_date_label(str(event["date"])),
+                    "subject": subject,
+                    "subjectCode": _subject_code(subject),
+                    "pct": event["pct"],
+                    "source": "assessment",
+                    "title": event.get("title") or "Assessment",
+                    "scored": event.get("scored"),
+                    "maxMarks": event.get("maxMarks"),
+                    "assessmentId": event.get("assessmentId"),
+                    "sessionId": event.get("sessionId"),
+                }
+            )
 
     events.sort(key=lambda e: e["date"])
     return events
@@ -141,8 +185,20 @@ def _score_events_for_cohort(
 def _student_assessment_attendance(
     db: Session, institution_id: str, student_id: str
 ) -> tuple[int, int]:
+    return _attendance_map_for_students(db, institution_id, [student_id]).get(
+        student_id, (100, 0)
+    )
+
+
+def _attendance_map_for_students(
+    db: Session, institution_id: str, student_ids: list[str]
+) -> dict[str, tuple[int, int]]:
+    """Batch attendance: one assessment scan for the whole cohort."""
     from app.utils import from_json_list
 
+    if not student_ids:
+        return {}
+    id_set = set(student_ids)
     assessments = (
         db.query(Assessment)
         .filter(
@@ -151,26 +207,38 @@ def _student_assessment_attendance(
         )
         .all()
     )
-    invited = 0
-    submitted = 0
+    invited: dict[str, int] = defaultdict(int)
+    submitted: dict[str, int] = defaultdict(int)
     for assessment in assessments:
         assigned = from_json_list(assessment.assigned_student_ids)
-        if not assigned or student_id not in assigned:
+        if not assigned:
             continue
-        invited += 1
-        sub = (
-            db.query(AssessmentSubmission)
+        for sid in assigned:
+            if sid not in id_set:
+                continue
+            invited[sid] += 1
+        subs = (
+            db.query(AssessmentSubmission.student_id)
             .filter(
                 AssessmentSubmission.assessment_id == assessment.id,
-                AssessmentSubmission.student_id == student_id,
+                AssessmentSubmission.student_id.in_(list(id_set)),
+                AssessmentSubmission.status.in_(("attended", "absent")),
             )
-            .first()
+            .all()
         )
-        if sub and sub.status in ("attended", "absent"):
-            submitted += 1
-    absent = max(0, invited - submitted)
-    pct = round((submitted / invited) * 100) if invited else 100
-    return pct, absent
+        for (sid,) in subs:
+            submitted[sid] += 1
+
+    out: dict[str, tuple[int, int]] = {}
+    for sid in student_ids:
+        inv = invited.get(sid, 0)
+        sub = submitted.get(sid, 0)
+        if inv <= 0:
+            out[sid] = (100, 0)
+        else:
+            pct = round(100 * sub / inv)
+            out[sid] = (pct, max(0, inv - sub))
+    return out
 
 
 def _pct_grade(pct: float) -> str:
@@ -319,8 +387,12 @@ def _build_student_profile(
         return None
 
     subj_scores: dict[str, list[int]] = defaultdict(list)
+    subject_names: dict[str, str] = {}
     for ev in events:
-        subj_scores[ev["subjectCode"]].append(ev["pct"])
+        code = ev.get("subjectCode") or _subject_code(ev["subject"])
+        subj_scores[code].append(ev["pct"])
+        # Prefer a real curriculum/mark label over the generic code name.
+        subject_names[code] = _subject_display_name(str(ev.get("subject") or ""), code)
 
     subj_avg: dict[str, int] = {}
     for code in SUBJECT_CODES:
@@ -328,11 +400,16 @@ def _build_student_profile(
         if vals:
             subj_avg[code] = round(mean(vals))
 
+    # Always keep a valid profile when score events exist — even if subjects map to OTH.
     if not subj_avg:
-        return None
-
-    overall_vals = list(subj_avg.values())
-    overall = round(mean(overall_vals))
+        overall = round(mean(int(e["pct"]) for e in events))
+        subj_avg = {"OTH": overall}
+        subject_names["OTH"] = _subject_display_name(
+            str(events[-1].get("subject") or "Other"), "OTH"
+        )
+    else:
+        overall_vals = list(subj_avg.values())
+        overall = round(mean(overall_vals))
 
     pct_series = [e["pct"] for e in events]
     consistency_sd = round(pstdev(pct_series), 1) if len(pct_series) >= 2 else 12.0
@@ -372,7 +449,10 @@ def _build_student_profile(
     daily_curve = [
         {
             "date": e["dateLabel"],
-            "subject": e["subjectCode"],
+            "subject": e.get("subjectCode") or _subject_code(e["subject"]),
+            "subjectName": e.get("subject") or SUBJECT_FULL.get(
+                e.get("subjectCode") or _subject_code(e["subject"]), "Subject"
+            ),
             "score": e["pct"],
             "title": e.get("title") or "Assessment",
         }
@@ -384,6 +464,10 @@ def _build_student_profile(
     return {
         "overall": overall,
         "subjAvg": subj_avg,
+        "subjectNames": {
+            code: subject_names.get(code) or SUBJECT_FULL.get(code, code)
+            for code in subj_avg
+        },
         "strongest": strongest,
         "weakest": weakest,
         "bestDay": best_day,
@@ -488,7 +572,10 @@ def _topic_rows_from_mastery(topics: list[dict]) -> list[dict]:
 
 
 def _topic_knowledge_layer(db: Session, institution_id: str, batch: Batch | None) -> tuple[list[dict], str]:
-    topics = _topic_mastery_rows(db, institution_id)
+    student_ids: set[str] | None = None
+    if batch:
+        student_ids = set(_batch_student_ids(db, batch.id))
+    topics = _topic_mastery_rows(db, institution_id, student_ids=student_ids)
     if batch:
         from app.services.syllabus_books import boards_match, grades_match
 
@@ -568,10 +655,13 @@ def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = N
         by_student[ev["studentId"]].append(ev)
 
     profiles_map = {s.id: s for s in cohort}
+    attendance = _attendance_map_for_students(
+        db, institution_id, [s.id for s in cohort]
+    )
     built: list[tuple[str, dict]] = []
     for sid, profile in profiles_map.items():
         name = profile.user.name
-        att_pct, absent = _student_assessment_attendance(db, institution_id, sid)
+        att_pct, absent = attendance.get(sid, (100, 0))
         prof = _build_student_profile(
             profile,
             by_student.get(sid, []),
@@ -630,6 +720,212 @@ def get_cohort_report(db: Session, institution_id: str, batch_id: str | None = N
     }
 
 
+def _cohort_data_fingerprint(
+    db: Session, institution_id: str, batch_id: str, student_ids: list[str]
+) -> str:
+    """Staleness key — invalidates when marks/assessment scores change, not only row counts."""
+    from sqlalchemy import func
+
+    marks_n = 0
+    marks_sum = 0.0
+    marks_latest = ""
+    if batch_id:
+        marks_n = (
+            db.query(func.count(MarksEntry.id))
+            .filter(
+                MarksEntry.institution_id == institution_id,
+                MarksEntry.batch_id == batch_id,
+            )
+            .scalar()
+            or 0
+        )
+        marks_sum = float(
+            db.query(func.coalesce(func.sum(MarksEntry.scored_marks), 0))
+            .filter(
+                MarksEntry.institution_id == institution_id,
+                MarksEntry.batch_id == batch_id,
+            )
+            .scalar()
+            or 0
+        )
+        marks_latest = (
+            db.query(func.max(MarksEntry.saved_at))
+            .filter(
+                MarksEntry.institution_id == institution_id,
+                MarksEntry.batch_id == batch_id,
+            )
+            .scalar()
+            or ""
+        )
+
+    subs_n = 0
+    score_sum = 0
+    subs_latest = ""
+    if student_ids:
+        subs_q = (
+            db.query(AssessmentSubmission)
+            .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
+            .filter(
+                AssessmentSubmission.student_id.in_(student_ids),
+                AssessmentSubmission.status == "attended",
+                AssessmentSubmission.max_score > 0,
+                Assessment.mode != "practice",
+                Assessment.institution_id == institution_id,
+            )
+        )
+        subs_n = subs_q.count()
+        score_sum = int(
+            db.query(func.coalesce(func.sum(AssessmentSubmission.score), 0))
+            .select_from(AssessmentSubmission)
+            .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
+            .filter(
+                AssessmentSubmission.student_id.in_(student_ids),
+                AssessmentSubmission.status == "attended",
+                AssessmentSubmission.max_score > 0,
+                Assessment.mode != "practice",
+                Assessment.institution_id == institution_id,
+            )
+            .scalar()
+            or 0
+        )
+        subs_latest = (
+            db.query(func.max(AssessmentSubmission.submitted_at))
+            .select_from(AssessmentSubmission)
+            .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
+            .filter(
+                AssessmentSubmission.student_id.in_(student_ids),
+                AssessmentSubmission.status == "attended",
+                Assessment.mode != "practice",
+                Assessment.institution_id == institution_id,
+            )
+            .scalar()
+            or ""
+        )
+    return (
+        f"{len(student_ids)}:{marks_n}:{int(marks_sum)}:{marks_latest}:"
+        f"{subs_n}:{score_sum}:{subs_latest}"
+    )
+
+
+def _store_cohort_report(
+    db: Session,
+    institution_id: str,
+    batch_id: str,
+    fingerprint: str,
+    payload: dict,
+    *,
+    commit: bool = True,
+) -> None:
+    computed_at = datetime.now().isoformat(timespec="minutes")
+    payload = {**payload, "computedAt": computed_at, "fingerprint": fingerprint}
+    row = db.get(BatchCohortReport, batch_id)
+    body = json.dumps(payload, ensure_ascii=False)
+    if row is None:
+        row = BatchCohortReport(
+            batch_id=batch_id,
+            institution_id=institution_id,
+            fingerprint=fingerprint,
+            payload=body,
+            computed_at=computed_at,
+        )
+        db.add(row)
+    else:
+        row.institution_id = institution_id
+        row.fingerprint = fingerprint
+        row.payload = body
+        row.computed_at = computed_at
+        db.add(row)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+
+
+def build_and_store_cohort_report(
+    db: Session,
+    institution_id: str,
+    batch_id: str,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Force-rebuild class insights for a batch and persist."""
+    payload = get_cohort_report(db, institution_id, batch_id)
+    resolved_batch_id = payload.get("batchId") or batch_id
+    if not resolved_batch_id:
+        return payload
+    student_ids = _batch_student_ids(db, resolved_batch_id)
+    fingerprint = _cohort_data_fingerprint(
+        db, institution_id, resolved_batch_id, student_ids
+    )
+    _store_cohort_report(
+        db,
+        institution_id,
+        resolved_batch_id,
+        fingerprint,
+        payload,
+        commit=commit,
+    )
+    return payload
+
+
+def get_or_build_cohort_report(
+    db: Session, institution_id: str, batch_id: str | None = None
+) -> dict:
+    """Serve stored class insights; rebuild only when missing or marks/tests changed."""
+    batch, cohort = _cohort_profiles(db, institution_id, batch_id)
+    if not batch:
+        return get_cohort_report(db, institution_id, batch_id)
+
+    student_ids = [s.id for s in cohort]
+    fingerprint = _cohort_data_fingerprint(db, institution_id, batch.id, student_ids)
+    row = db.get(BatchCohortReport, batch.id)
+    if row and row.fingerprint == fingerprint and (row.payload or "").strip():
+        try:
+            stored = json.loads(row.payload)
+            if isinstance(stored, dict):
+                stored.setdefault("computedAt", row.computed_at)
+                stored.setdefault("fingerprint", row.fingerprint)
+                return stored
+        except json.JSONDecodeError:
+            logger.warning("Corrupt cohort report payload batch=%s — rebuilding", batch.id)
+
+    payload = get_cohort_report(db, institution_id, batch.id)
+    _store_cohort_report(
+        db, institution_id, batch.id, fingerprint, payload, commit=True
+    )
+    return payload
+
+
+def refresh_cohort_reports_for_students(
+    db: Session,
+    institution_id: str,
+    student_ids: list[str],
+    *,
+    commit: bool = True,
+) -> list[str]:
+    """Rebuild stored class insights for every batch those students belong to."""
+    if not student_ids:
+        return []
+    rows = (
+        db.query(BatchStudent.batch_id)
+        .filter(BatchStudent.student_id.in_(student_ids))
+        .distinct()
+        .all()
+    )
+    refreshed: list[str] = []
+    for (batch_id,) in rows:
+        try:
+            build_and_store_cohort_report(
+                db, institution_id, batch_id, commit=False
+            )
+            refreshed.append(batch_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed refreshing cohort report batch=%s", batch_id)
+    if commit:
+        db.commit()
+    return refreshed
+
+
 def get_student_genome(db: Session, institution_id: str, student_id: str) -> dict | None:
     profile = db.get(StudentProfile, student_id)
     if not profile or profile.user.institution_id != institution_id:
@@ -686,7 +982,7 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
     total = len(_batch_student_ids(db, batch.id)) if batch else 1
     rank = 1
     if batch:
-        cohort_report = get_cohort_report(db, institution_id, batch.id)
+        cohort_report = get_or_build_cohort_report(db, institution_id, batch.id)
         rank = cohort_report.get("students", {}).get(profile.user.name, {}).get("rank", 1)
         genome["rank"] = rank
         total = max(cohort_report.get("meta", {}).get("batchStudentCount", total), 1)

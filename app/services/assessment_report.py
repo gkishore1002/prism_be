@@ -167,7 +167,38 @@ def _attach_exam_knowledge(db: Session, payload: dict) -> dict:
     return payload
 
 
-def _report_to_dict(report: AssessmentStudentReport) -> dict:
+def _live_class_stats(
+    db: Session, assessment_id: str, student_id: str, accuracy: int
+) -> tuple[int | None, int | None, int]:
+    """Fresh class average + rank from attended submissions (not frozen stored values)."""
+    assessment = db.get(Assessment, assessment_id)
+    live_avg = assessment.class_avg if assessment else None
+    rank, total = _rank_in_class(db, assessment_id, student_id, accuracy)
+    if live_avg is None and total > 0:
+        submissions = (
+            db.query(AssessmentSubmission)
+            .filter(
+                AssessmentSubmission.assessment_id == assessment_id,
+                AssessmentSubmission.status == "attended",
+                AssessmentSubmission.max_score > 0,
+            )
+            .all()
+        )
+        if submissions:
+            live_avg = round(
+                mean((s.score / s.max_score) * 100 for s in submissions if s.max_score)
+            )
+    return live_avg, rank, total
+
+
+def _report_to_dict(report: AssessmentStudentReport, *, batch_name: str | None = None) -> dict:
+    from app.services.subjects_list import normalize_subjects
+
+    subject_scores = _parse_json_list(report.subject_scores)
+    subjects = normalize_subjects(
+        [row.get("subject") for row in subject_scores if isinstance(row, dict)],
+        report.subject,
+    )
     return {
         "id": report.id,
         "assessmentId": report.assessment_id,
@@ -175,6 +206,8 @@ def _report_to_dict(report: AssessmentStudentReport) -> dict:
         "submissionId": report.submission_id,
         "assessmentTitle": report.assessment_title,
         "subject": report.subject,
+        "subjects": subjects,
+        "batchName": batch_name,
         "score": report.score,
         "maxScore": report.max_score,
         "accuracy": report.accuracy_pct,
@@ -183,7 +216,7 @@ def _report_to_dict(report: AssessmentStudentReport) -> dict:
         "totalInClass": report.total_in_class,
         "timeSpentMin": report.time_spent_min,
         "submittedAt": report.submitted_at,
-        "subjectScores": _parse_json_list(report.subject_scores),
+        "subjectScores": subject_scores,
         "strongTopics": _parse_json_list(report.strong_topics),
         "weakTopics": _parse_json_list(report.weak_topics),
         "summary": report.summary,
@@ -197,7 +230,19 @@ def _report_to_dict(report: AssessmentStudentReport) -> dict:
 
 
 def _report_dict(db: Session, report: AssessmentStudentReport) -> dict:
-    return _attach_exam_knowledge(db, _report_to_dict(report))
+    assessment = db.get(Assessment, report.assessment_id)
+    batch_name = assessment.batch_name if assessment else None
+    payload = _attach_exam_knowledge(db, _report_to_dict(report, batch_name=batch_name))
+    live_avg, rank, total = _live_class_stats(
+        db, report.assessment_id, report.student_id, report.accuracy_pct
+    )
+    if live_avg is not None:
+        payload["classAvg"] = live_avg
+    if rank is not None:
+        payload["rankInClass"] = rank
+    if total:
+        payload["totalInClass"] = total
+    return payload
 
 
 def _report_to_student_summary(report: AssessmentStudentReport) -> dict:
@@ -264,30 +309,37 @@ def build_and_store_assessment_report(
         db, assessment.institution_id, student_id, submission
     )
     rank, total = _rank_in_class(db, assessment_id, student_id, accuracy)
-    subject_scores = [
-        {
-            "subject": assessment.subject,
-            "score": submission.score,
-            "maxScore": submission.max_score,
-            "accuracy": accuracy,
-        }
-    ]
+
+    from app.services.subjects_list import subjects_from_stored, subjects_label
+
+    paper_subjects = subjects_from_stored(
+        assessment.subject, getattr(assessment, "subjects", None)
+    )
+    subject_label = subjects_label(paper_subjects) or assessment.subject or "Subject"
+    subject_scores = recompute_svc.submission_subject_scores(
+        db,
+        submission,
+        fallback_subjects=paper_subjects,
+        total_score=submission.score,
+        total_max=submission.max_score,
+    )
     rule_summary = _rule_summary(
         profile.user.name,
         assessment.title,
-        assessment.subject,
+        subject_label,
         accuracy,
         assessment.class_avg,
         strong_topics,
         weak_topics,
     )
     rule_summary_ta = _rule_summary_ta(
-        profile.user.name, assessment.title, assessment.subject, accuracy
+        profile.user.name, assessment.title, subject_label, accuracy
     )
     context = {
         "studentName": profile.user.name,
         "assessmentTitle": assessment.title,
-        "subject": assessment.subject,
+        "subject": subject_label,
+        "subjects": paper_subjects,
         "board": assessment.board,
         "grade": assessment.grade,
         "score": submission.score,
@@ -325,7 +377,7 @@ def build_and_store_assessment_report(
         report = existing
         report.submission_id = submission.id
         report.assessment_title = assessment.title
-        report.subject = assessment.subject
+        report.subject = subject_label
         report.score = submission.score
         report.max_score = submission.max_score
         report.accuracy_pct = accuracy
@@ -350,7 +402,7 @@ def build_and_store_assessment_report(
             student_id=student_id,
             submission_id=submission.id,
             assessment_title=assessment.title,
-            subject=assessment.subject,
+            subject=subject_label,
             score=submission.score,
             max_score=submission.max_score,
             accuracy_pct=accuracy,
@@ -443,9 +495,14 @@ def list_assessment_reports(
     )
     stored_by_assessment = {row.assessment_id: row for row in stored}
 
-    submissions_q = db.query(AssessmentSubmission).filter(
-        AssessmentSubmission.student_id == student_id,
-        AssessmentSubmission.status == "attended",
+    submissions_q = (
+        db.query(AssessmentSubmission)
+        .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
+        .filter(
+            AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status == "attended",
+            Assessment.mode != "practice",
+        )
     )
     if enrollment_id:
         submissions_q = submissions_q.filter(AssessmentSubmission.enrollment_id == enrollment_id)
@@ -476,44 +533,12 @@ def list_assessment_reports(
 
 
 def refresh_reports_for_assessment(db: Session, assessment_id: str) -> list[str]:
-    """Force AI regenerate for every attended student on this assessment + overall/genome insights."""
-    from app.services.student_genome_report import build_and_store_genome_report
-    from app.services.student_overall_report import build_and_store_overall_report
+    """Force regenerate stored reports for every attended student on this assessment.
 
-    assessment = db.get(Assessment, assessment_id)
-    if not assessment:
-        return []
+    Prefer report_jobs.run_after_assessment_completed / enqueue_report_job from API
+    write paths; this remains for direct service callers and tests.
+    """
+    from app.services.report_jobs import run_after_assessment_completed
 
-    student_ids = [
-        row.student_id
-        for row in db.query(AssessmentSubmission.student_id)
-        .filter(
-            AssessmentSubmission.assessment_id == assessment_id,
-            AssessmentSubmission.status == "attended",
-        )
-        .distinct()
-        .all()
-    ]
-    refreshed: list[str] = []
-    for student_id in student_ids:
-        try:
-            build_and_store_assessment_report(
-                db, assessment_id, student_id, force=True, use_ai=True, commit=False
-            )
-            build_and_store_overall_report(db, student_id, use_ai=True, commit=False)
-            build_and_store_genome_report(
-                db,
-                assessment.institution_id,
-                student_id,
-                use_ai=True,
-                commit=False,
-            )
-            refreshed.append(student_id)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Failed refreshing reports assessment=%s student=%s",
-                assessment_id,
-                student_id,
-            )
-    db.commit()
-    return refreshed
+    result = run_after_assessment_completed(db, assessment_id)
+    return list(result.get("refreshedStudents") or [])

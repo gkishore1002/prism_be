@@ -150,3 +150,19 @@ class StudentGenomeReport(Base):
     narrative_ta: Mapped[str] = mapped_column(Text, default="")
     narrative_source: Mapped[str] = mapped_column(String(16), default="rule-based")
     computed_at: Mapped[str] = mapped_column(String(32), default="")
+
+
+class BatchCohortReport(Base):
+    """Persisted class insights / Learning Genome cohort payload for a batch.
+
+    Regenerated when marks are published or assessments are scored — GET reads store only
+    (rebuilds once if missing or fingerprint changed).
+    """
+
+    __tablename__ = "batch_cohort_reports"
+
+    batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey(institution_fk_target()), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    payload: Mapped[str] = mapped_column(Text, default="{}")  # JSON cohort report
+    computed_at: Mapped[str] = mapped_column(String(32), default="")

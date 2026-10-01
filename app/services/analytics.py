@@ -908,9 +908,15 @@ def get_recent_assessments(
     enrollment_id: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    q = db.query(AssessmentSubmission).filter(
-        AssessmentSubmission.student_id == student_id,
-        AssessmentSubmission.status.in_(("attended", "absent")),
+    q = (
+        db.query(AssessmentSubmission)
+        .join(Assessment, Assessment.id == AssessmentSubmission.assessment_id)
+        .filter(
+            AssessmentSubmission.student_id == student_id,
+            AssessmentSubmission.status == "attended",
+            AssessmentSubmission.max_score > 0,
+            Assessment.mode != "practice",
+        )
     )
     if enrollment_id:
         q = q.filter(AssessmentSubmission.enrollment_id == enrollment_id)
@@ -956,8 +962,12 @@ def get_student_wise_report(db: Session, student_id: str) -> dict | None:
     strong = [t["topic"] for t in sorted(topics, key=lambda x: x["mastery"], reverse=True) if t["mastery"] >= 70][:2]
     weak = [g["topicName"] for g in gaps[:3]]
     recent = get_recent_assessments(db, student_id)
-    accuracies = [r["accuracy"] for r in recent]
-    avg_accuracy = round(mean(accuracies)) if accuracies else profile.health
+    # Overall score = mean of marks + attended assessments (not assessment-only).
+    score_events = recompute_svc.student_score_events(db, profile.user.institution_id, student_id)
+    if score_events:
+        avg_accuracy = round(mean(int(e["pct"]) for e in score_events))
+    else:
+        avg_accuracy = profile.health
     rule_insight = (
         f"{profile.user.name} is {'improving' if profile.improving else 'needs support'} "
         f"with {profile.critical_gaps} critical gaps."
@@ -1332,12 +1342,9 @@ def get_tutor_copilot_summary(
 
 
 def _subject_name_matches(candidate: str, query: str) -> bool:
-    c = candidate.strip().lower()
-    q = query.strip().lower()
-    if not c or not q:
-        return False
-    return c == q or q in c or c in q
+    from app.services.subjects_list import subject_names_match
 
+    return subject_names_match(candidate, query)
 
 def get_subject_topics(db: Session, institution_id: str, subject: str) -> list[dict]:
     rows = _topic_mastery_rows(db, institution_id)

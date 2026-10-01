@@ -10,13 +10,7 @@ from app.core.routing import CamelCaseAPIRoute
 from app.models.user import User
 from app.schemas.base import CamelModel
 from app.services import marks as marks_svc
-from app.services.student_genome_report import refresh_student_insight_reports
-from app.services.tenant_context import (
-    close_tenant_db,
-    open_tenant_db,
-    safe_reset_tenant_context,
-    set_tenant_context,
-)
+from app.services.report_jobs import enqueue_report_job
 
 logger = logging.getLogger(__name__)
 
@@ -48,31 +42,6 @@ class MarksDraftSaveIn(CamelModel):
     columns: list[MarksColumnIn] = Field(default_factory=list)
     marks: dict[str, dict[str, str | float]] = Field(default_factory=dict)
     student_ids: list[str] = Field(default_factory=list, alias="studentIds")
-
-
-def _refresh_reports_after_marks(
-    student_ids: list[str],
-    schema_name: str | None,
-    institution_id: str,
-) -> None:
-    """Background: regenerate overall + genome AI reports after marks publish/save."""
-    if not student_ids:
-        return
-    tokens = set_tenant_context(schema_name=schema_name or "public", institution_id=institution_id)
-    db = open_tenant_db(schema_name)
-    try:
-        refreshed = refresh_student_insight_reports(
-            db, institution_id, student_ids, use_ai=True
-        )
-        logger.info(
-            "Refreshed stored insight reports after marks students=%s",
-            len(refreshed),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Insight report refresh failed after marks save")
-    finally:
-        close_tenant_db(db)
-        safe_reset_tenant_context(tokens)
 
 
 @router.get("")
@@ -201,16 +170,17 @@ def publish_marks_draft(
             if entry.get("studentId")
         }
     )
-    if not student_ids:
-        # Fallback: drafts publish returns entries; if not, skip refresh.
-        student_ids = []
-    schema_name = getattr(request.state, "tenant_schema", None)
+    batch_id = result.get("batchId") or (
+        (result.get("entries") or [{}])[0].get("batchId") if result.get("entries") else None
+    )
     if student_ids:
-        background_tasks.add_task(
-            _refresh_reports_after_marks,
-            student_ids,
-            schema_name,
+        enqueue_report_job(
+            background_tasks,
+            "marks_uploaded",
+            request,
             user.institution_id,
+            student_ids=student_ids,
+            batch_id=batch_id,
         )
     return result
 
@@ -239,13 +209,15 @@ def save_marks_bulk(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    schema_name = getattr(request.state, "tenant_schema", None)
-    background_tasks.add_task(
-        _refresh_reports_after_marks,
-        list(body.student_ids),
-        schema_name,
-        user.institution_id,
-    )
+    if body.student_ids:
+        enqueue_report_job(
+            background_tasks,
+            "marks_uploaded",
+            request,
+            user.institution_id,
+            student_ids=list(body.student_ids),
+            batch_id=body.batch_id,
+        )
     return result
 
 

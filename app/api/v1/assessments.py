@@ -23,7 +23,7 @@ from app.services.assessment_access import (
     mark_absent_for_pending_students,
 )
 from app.services.assessment_queries import list_assessments_for_student
-from app.services.assessment_report import refresh_reports_for_assessment
+from app.services.report_jobs import enqueue_report_job
 from app.services.submissions import (
     existing_attempt,
     existing_submission,
@@ -36,12 +36,6 @@ from app.services.audit_log import record_audit
 from app.services import exam_proctoring as proctor_svc
 from app.services import enrollments as enr_svc
 from app.services.subjects_list import normalize_subjects, primary_subject, subjects_from_stored, subjects_json
-from app.services.tenant_context import (
-    close_tenant_db,
-    open_tenant_db,
-    safe_reset_tenant_context,
-    set_tenant_context,
-)
 from app.schemas import (
     AssessmentAccessRequestCreate,
     AssessmentAccessRequestOut,
@@ -67,28 +61,6 @@ from app.utils import dict_get, from_json_list, to_json_list
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["assessments"], route_class=CamelCaseAPIRoute)
-
-
-def _refresh_reports_after_assessment_update(
-    assessment_id: str,
-    schema_name: str | None,
-    institution_id: str,
-) -> None:
-    """Background: regenerate stored assessment + overall + genome AI reports after mark completed."""
-    tokens = set_tenant_context(schema_name=schema_name or "public", institution_id=institution_id)
-    db = open_tenant_db(schema_name)
-    try:
-        refreshed = refresh_reports_for_assessment(db, assessment_id)
-        logger.info(
-            "Refreshed stored reports for assessment=%s students=%s",
-            assessment_id,
-            len(refreshed),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Report refresh failed for assessment=%s", assessment_id)
-    finally:
-        close_tenant_db(db)
-        safe_reset_tenant_context(tokens)
 
 
 def _client_meta(request: Request) -> tuple[str | None, str | None]:
@@ -611,12 +583,12 @@ def update_assessment(
     db.commit()
 
     if just_completed:
-        schema_name = getattr(request.state, "tenant_schema", None)
-        background_tasks.add_task(
-            _refresh_reports_after_assessment_update,
-            assessment_id,
-            schema_name,
+        enqueue_report_job(
+            background_tasks,
+            "assessment_completed",
+            request,
             user.institution_id,
+            assessment_id=assessment_id,
         )
 
     return _assessment_out(a)
@@ -854,6 +826,7 @@ def record_exam_violation(
     assessment_id: str,
     body: ExamViolationCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("student")),
 ) -> ExamViolationRecordOut:
@@ -872,6 +845,15 @@ def record_exam_violation(
         occurred_at=body.timestamp,
         user_agent=ua,
     )
+    if terminated and submission and assessment.mode != "practice":
+        enqueue_report_job(
+            background_tasks,
+            "assessment_submitted",
+            request,
+            user.institution_id,
+            assessment_id=assessment_id,
+            student_id=profile.id,
+        )
     return ExamViolationRecordOut(
         terminated=terminated,
         violation_count=count,
@@ -908,6 +890,8 @@ def list_exam_violations(
 def submit_assessment(
     assessment_id: str,
     body: AssessmentSubmissionCreate,
+    request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("student")),
 ) -> AssessmentSubmissionOut:
@@ -960,6 +944,15 @@ def submit_assessment(
         termination_reason=None,
         commit=True,
     )
+    if assessment.mode != "practice":
+        enqueue_report_job(
+            background_tasks,
+            "assessment_submitted",
+            request,
+            user.institution_id,
+            assessment_id=assessment_id,
+            student_id=profile.id,
+        )
     return _submission_out(submission)
 
 

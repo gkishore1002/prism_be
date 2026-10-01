@@ -126,7 +126,9 @@ def save_marks_bulk(
     created: list[MarksEntry] = []
 
     for col in columns:
-        subject = (col.get("subject") or "").strip()
+        from app.services.subjects_list import canonicalize_subject_name
+
+        subject = canonicalize_subject_name(col.get("subject") or "") or (col.get("subject") or "").strip()
         conducted_on = col.get("conductedOn") or col.get("conducted_on") or saved_at[:10]
         max_marks = int(col.get("maxMarks") or col.get("max_marks") or 0)
         col_id = col.get("id") or col.get("columnId") or subject
@@ -175,23 +177,29 @@ def save_marks_bulk(
         "sessionId": session_id,
         "savedAt": saved_at,
         "count": len(created),
+        "batchId": batch_id,
         "entries": [_entry_dict(db, row) for row in created],
     }
 
 
 def _refresh_batch_avg_score(db: Session, batch_id: str, institution_id: str) -> None:
+    """Batch average from marks + attended assessments for students in the batch."""
+    from app.models.content import BatchStudent
+    from app.services.analytics_recompute import student_score_events
+
     batch = db.get(Batch, batch_id)
     if not batch:
         return
-    rows = (
-        db.query(MarksEntry)
-        .filter(MarksEntry.institution_id == institution_id, MarksEntry.batch_id == batch_id)
-        .all()
-    )
-    if rows:
-        batch.avg_score = round(mean(r.percentage for r in rows))
-        return
-    # fallback: leave existing avg_score
+    student_ids = [
+        row.student_id
+        for row in db.query(BatchStudent.student_id).filter(BatchStudent.batch_id == batch_id).all()
+    ]
+    scores: list[int] = []
+    for sid in student_ids:
+        for event in student_score_events(db, institution_id, sid):
+            scores.append(int(event["pct"]))
+    if scores:
+        batch.avg_score = round(mean(scores))
 
 
 def marks_for_students(

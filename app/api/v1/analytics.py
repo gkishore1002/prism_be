@@ -435,7 +435,7 @@ def tutor_cohort_report(
 ) -> dict:
     from app.services import cohort_report as cohort_svc
 
-    return cohort_svc.get_cohort_report(db, user.institution_id, batch_id)
+    return cohort_svc.get_or_build_cohort_report(db, user.institution_id, batch_id)
 
 
 @router.get("/student/genome")

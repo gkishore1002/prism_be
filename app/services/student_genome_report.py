@@ -124,7 +124,8 @@ def refresh_student_insight_reports(
     *,
     use_ai: bool = True,
 ) -> list[str]:
-    """Regenerate overall + genome AI insights for the given students."""
+    """Regenerate overall + genome AI insights and class insights for affected batches."""
+    from app.services.cohort_report import refresh_cohort_reports_for_students
     from app.services.student_overall_report import build_and_store_overall_report
 
     refreshed: list[str] = []
@@ -137,5 +138,11 @@ def refresh_student_insight_reports(
             refreshed.append(student_id)
         except Exception:  # noqa: BLE001
             logger.exception("Failed refreshing insight reports student=%s", student_id)
+    try:
+        refresh_cohort_reports_for_students(
+            db, institution_id, student_ids, commit=False
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed refreshing cohort reports for students=%s", len(student_ids))
     db.commit()
     return refreshed

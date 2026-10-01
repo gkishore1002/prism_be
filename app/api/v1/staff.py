@@ -184,22 +184,24 @@ def list_staff(
         out = [_staff_out(db, row) for row in rows]
         return paginate_list(out, page=page, limit=limit)
 
+    # Year context attaches placement when present, but still lists staff without an
+    # assignment so Manage matches dashboard totalStaff (demo/seed users often lack rows).
     assignments = {
         a.staff_id: a
         for a in sa_svc.list_assignments_for_year(
             db,
             user.institution_id,
             year.id,
-            center_id=center_id if center_id else None,
+            center_id=None,
         )
     }
     out: list[StaffOut] = []
     for row in rows:
         assignment = assignments.get(row.id)
-        if not assignment:
-            continue
-        if center_id and assignment.center_id != center_id:
-            continue
+        if center_id:
+            # Branch filter: only staff placed at that center for the year.
+            if not assignment or assignment.center_id != center_id:
+                continue
         out.append(_staff_out(db, row, assignment=assignment, academic_year_id=year.id))
     return paginate_list(out, page=page, limit=limit)
 

@@ -63,11 +63,19 @@ def _seed_demo_institution(public_db: Session) -> Institution | None:
 
 
 def _seed_demo_extra_users(public_db: Session, institution: Institution) -> None:
-    """Add tutor + student to demo tenant if missing."""
-    from app.db.session import SessionLocal
+    """Add tutor + student to demo tenant if missing; ensure current-year staff placements."""
     from app.models.institution import Center
     from app.models.user import StudentProfile, User
-    from app.services.tenant_context import close_tenant_db, is_multi_schema_enabled, open_tenant_db, safe_reset_tenant_context, set_tenant_context
+    from app.services import enrollments as enr_svc
+    from app.services import staff_assignments as sa_svc
+    from app.services.tenant_context import (
+        close_tenant_db,
+        is_multi_schema_enabled,
+        open_tenant_db,
+        safe_reset_tenant_context,
+        set_tenant_context,
+    )
+    from app.services.user_roles import is_admin_account, is_tutor_account
 
     schema_name = institution.schema_name or "public"
     if is_multi_schema_enabled():
@@ -127,6 +135,26 @@ def _seed_demo_extra_users(public_db: Session, institution: Institution) -> None
                     batch="",
                     center_id=center.id,
                 )
+            )
+
+        # Manage Staff is year-scoped — place demo admin/tutor on the current year at HQ.
+        year = enr_svc.get_current_academic_year(db, institution.id)
+        if year is None:
+            year = enr_svc.ensure_academic_year(
+                db, institution.id, "2025-26", make_current=True
+            )
+        staff_users = [
+            u
+            for u in db.query(User).filter(User.institution_id == institution.id).all()
+            if is_admin_account(u) or is_tutor_account(u)
+        ]
+        for staff in staff_users:
+            sa_svc.ensure_assignment_for_year(
+                db,
+                staff=staff,
+                academic_year_id=year.id,
+                center_id=center.id,
+                status_value="active",
             )
 
         if is_multi_schema_enabled():

@@ -518,6 +518,30 @@ def ensure_student_genome_reports(engine: Engine, schema: str | None = None) -> 
         )
 
 
+def ensure_batch_cohort_reports(engine: Engine, schema: str | None = None) -> None:
+    inspector = inspect(engine)
+    schema_kw = schema if schema and schema != "public" else None
+    if inspector.has_table("batch_cohort_reports", schema=schema_kw):
+        return
+    batches_ref = f"{schema}.batches(id)" if schema_kw else "batches(id)"
+    inst_ref = "public.institutions(id)" if schema_kw else _inst_ref(engine)
+    table = f"{schema}.batch_cohort_reports" if schema_kw else "batch_cohort_reports"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    batch_id VARCHAR(32) PRIMARY KEY REFERENCES {batches_ref},
+                    institution_id VARCHAR(32) NOT NULL REFERENCES {inst_ref},
+                    fingerprint VARCHAR(64) NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL DEFAULT '{{}}',
+                    computed_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+
+
 def _inst_ref(engine: Engine) -> str:
     if engine.dialect.name == "postgresql":
         return "public.institutions(id)"
@@ -732,6 +756,19 @@ def backfill_staff_assignments(engine: Engine, schema: str | None = None) -> Non
                 ),
                 {"uid": staff_id},
             ).fetchone()
+            # Owners/tutors may have no portal branch rows — fall back to HQ/first center.
+            if not center:
+                center = conn.execute(
+                    text(
+                        f"""
+                        SELECT id FROM {prefix}centers
+                        WHERE institution_id = :iid
+                        ORDER BY name ASC, id ASC
+                        LIMIT 1
+                        """
+                    ),
+                    {"iid": institution_id},
+                ).fetchone()
             if not center:
                 continue
             conn.execute(
@@ -1171,6 +1208,9 @@ def run_migrations(engine: Engine) -> None:
     ensure_student_genome_reports(engine)
     if is_multi_schema_enabled():
         patch_all_tenant_schemas(engine, ensure_student_genome_reports)
+    ensure_batch_cohort_reports(engine)
+    if is_multi_schema_enabled():
+        patch_all_tenant_schemas(engine, ensure_batch_cohort_reports)
     ensure_assessment_available_until(engine)
     ensure_assessment_shuffle_questions(engine)
     if is_multi_schema_enabled():

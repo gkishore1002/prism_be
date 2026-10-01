@@ -43,17 +43,45 @@ def _parse_event_date(value: str) -> datetime | None:
         return None
 
 
+def _month_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m")
+
+
 def _month_label(dt: datetime) -> str:
-    return dt.strftime("%b")
+    return dt.strftime("%b %Y")
+
+
+def monthly_trend_from_events(events: list[dict]) -> list[dict]:
+    by_month: dict[str, list[int]] = defaultdict(list)
+    labels: dict[str, str] = {}
+    for event in events:
+        dt = _parse_event_date(str(event["date"]))
+        if not dt:
+            continue
+        key = _month_key(dt)
+        by_month[key].append(event["pct"])
+        labels[key] = _month_label(dt)
+    if not by_month:
+        return []
+    ordered = sorted(by_month.items(), key=lambda item: item[0])
+    return [
+        {"month": labels.get(month, month), "score": round(mean(scores))}
+        for month, scores in ordered
+    ]
 
 
 def student_score_events(db: Session, institution_id: str, student_id: str) -> list[dict]:
+    """Marks + attended Prism assessments only — excludes absents and practice."""
+    from app.services.subjects_list import canonicalize_subject_name, subjects_from_stored, subjects_label
+
     events: list[dict] = []
     for row in marks_for_students(db, institution_id, [student_id]):
+        if row.max_marks is not None and int(row.max_marks) <= 0:
+            continue
         events.append(
             {
                 "pct": row.percentage,
-                "subject": row.subject,
+                "subject": canonicalize_subject_name(row.subject) or row.subject,
                 "date": row.conducted_on,
                 "source": "marks",
                 "title": row.assessment_title,
@@ -70,7 +98,9 @@ def student_score_events(db: Session, institution_id: str, student_id: str) -> l
         .filter(
             Assessment.institution_id == institution_id,
             AssessmentSubmission.student_id == student_id,
-            AssessmentSubmission.status.in_(("attended", "absent")),
+            AssessmentSubmission.status == "attended",
+            AssessmentSubmission.max_score > 0,
+            Assessment.mode != "practice",
         )
         .all()
     )
@@ -79,19 +109,46 @@ def student_score_events(db: Session, institution_id: str, student_id: str) -> l
         if not assessment:
             continue
         pct = round((sub.score / sub.max_score) * 100) if sub.max_score else 0
-        events.append(
-            {
-                "pct": pct,
-                "subject": assessment.subject,
-                "date": sub.submitted_at,
-                "source": "assessment",
-                "title": assessment.title,
-                "scored": float(sub.score),
-                "maxMarks": int(sub.max_score),
-                "assessmentId": assessment.id,
-                "sessionId": assessment.id,
-            }
+        subjects = subjects_from_stored(assessment.subject, getattr(assessment, "subjects", None))
+        subject_label = subjects_label(subjects) or canonicalize_subject_name(assessment.subject) or assessment.subject
+        # Multi-subject papers emit one event per known subject only when we can
+        # attribute scores; otherwise one labelled event with the paper subjects.
+        per_subject = submission_subject_scores(
+            db,
+            sub,
+            fallback_subjects=subjects,
+            total_score=sub.score,
+            total_max=sub.max_score,
         )
+        if len(per_subject) > 1:
+            for row in per_subject:
+                events.append(
+                    {
+                        "pct": int(row["accuracy"]),
+                        "subject": row["subject"],
+                        "date": sub.submitted_at,
+                        "source": "assessment",
+                        "title": assessment.title,
+                        "scored": float(row["score"]),
+                        "maxMarks": int(row["maxScore"]),
+                        "assessmentId": assessment.id,
+                        "sessionId": assessment.id,
+                    }
+                )
+        else:
+            events.append(
+                {
+                    "pct": pct,
+                    "subject": (per_subject[0]["subject"] if per_subject else subject_label),
+                    "date": sub.submitted_at,
+                    "source": "assessment",
+                    "title": assessment.title,
+                    "scored": float(sub.score),
+                    "maxMarks": int(sub.max_score),
+                    "assessmentId": assessment.id,
+                    "sessionId": assessment.id,
+                }
+            )
 
     events.sort(key=lambda e: _parse_event_date(str(e["date"])) or datetime.min)
     return events
@@ -109,6 +166,7 @@ def _topic_answer_stats(
         .filter(
             Assessment.institution_id == institution_id,
             AssessmentSubmission.status == "attended",
+            Assessment.mode != "practice",
         )
     )
     if student_ids is not None:
@@ -200,17 +258,13 @@ def topic_mastery_rows(
 
 
 def subject_scores_for_student(db: Session, institution_id: str, student_id: str) -> list[dict]:
+    """Subject health from marks + attended assessments only (not topic mastery)."""
     by_subject: dict[str, list[int]] = defaultdict(list)
-    for event in student_score_events(db, institution_id, student_id):
+    all_events = student_score_events(db, institution_id, student_id)
+    for event in all_events:
         by_subject[event["subject"]].append(event["pct"])
 
-    topic_rows = topic_mastery_rows(db, institution_id, student_id=student_id)
-    for row in topic_rows:
-        if row["mastery"] > 0:
-            by_subject[row["subject"]].append(row["mastery"])
-
     subjects_out = []
-    all_events = student_score_events(db, institution_id, student_id)
     for subject, scores in sorted(by_subject.items()):
         score = round(mean(scores))
         subjects_out.append(
@@ -328,6 +382,106 @@ def submission_topic_breakdown(db: Session, submission: AssessmentSubmission | N
     return rows
 
 
+def submission_subject_scores(
+    db: Session,
+    submission: AssessmentSubmission | None,
+    *,
+    fallback_subjects: list[str] | None = None,
+    total_score: int | None = None,
+    total_max: int | None = None,
+) -> list[dict]:
+    """Per-subject score rows for one exam attempt (from question subjects).
+
+    Falls back to a single overall row using fallback_subjects / totals when
+    answers are missing or questions are untagged.
+    """
+    from app.services.subjects_list import (
+        canonicalize_subject_name,
+        primary_subject,
+        subjects_label,
+    )
+
+    fallback = [canonicalize_subject_name(s) for s in (fallback_subjects or []) if (s or "").strip()]
+    fallback = [s for s in fallback if s]
+    overall_score = int(total_score if total_score is not None else (submission.score if submission else 0))
+    overall_max = int(total_max if total_max is not None else (submission.max_score if submission else 0))
+    overall_acc = round((overall_score / overall_max) * 100) if overall_max else 0
+
+    def _overall_row() -> list[dict]:
+        label = subjects_label(fallback) or primary_subject(fallback, "Overall")
+        return [
+            {
+                "subject": label,
+                "score": overall_score,
+                "maxScore": overall_max,
+                "accuracy": overall_acc,
+            }
+        ]
+
+    if submission is None:
+        return _overall_row()
+
+    try:
+        answers = json.loads(submission.answers or "[]")
+    except json.JSONDecodeError:
+        return _overall_row()
+    if not isinstance(answers, list) or not answers:
+        return _overall_row()
+
+    buckets: dict[str, dict[str, int]] = {}
+    for ans in answers:
+        if not isinstance(ans, dict):
+            continue
+        qid = dict_get(ans, "question_id", "questionId")
+        if not qid:
+            continue
+        question = db.get(Question, qid)
+        if not question:
+            continue
+        subject = canonicalize_subject_name(question.subject)
+        if not subject and question.topic_id:
+            topic_row = db.get(Topic, question.topic_id)
+            if topic_row and topic_row.chapter and topic_row.chapter.subject:
+                subject = canonicalize_subject_name(topic_row.chapter.subject.name)
+        if not subject:
+            subject = primary_subject(fallback, "Overall")
+        selected = dict_get(ans, "selected_option", "selectedOption", default="")
+        correct = bool(
+            question.correct_answer
+            and selected
+            and str(selected).upper() == question.correct_answer.upper()
+        )
+        marks = max(1, int(getattr(question, "marks", None) or 1))
+        rec = buckets.setdefault(subject, {"score": 0, "maxScore": 0})
+        rec["maxScore"] += marks
+        if correct:
+            rec["score"] += marks
+
+    if not buckets:
+        return _overall_row()
+
+    # If every question landed in one bucket that is "Overall" but we know the
+    # paper subjects, prefer the paper label for display.
+    if len(buckets) == 1 and fallback:
+        only_key = next(iter(buckets))
+        if only_key.casefold() in {"overall", ""}:
+            return _overall_row()
+
+    rows = []
+    for subject, rec in sorted(buckets.items(), key=lambda item: item[0].casefold()):
+        max_score = int(rec["maxScore"])
+        score = int(rec["score"])
+        rows.append(
+            {
+                "subject": subject,
+                "score": score,
+                "maxScore": max_score,
+                "accuracy": round((score / max_score) * 100) if max_score else 0,
+            }
+        )
+    return rows
+
+
 def recompute_student_profile(db: Session, student_id: str) -> StudentProfile | None:
     profile = db.get(StudentProfile, student_id)
     if not profile:
@@ -387,19 +541,6 @@ def recompute_all_institutions(db: Session) -> int:
             total += recompute_students(db, inst_id, commit=False)
     db.commit()
     return total
-
-
-def monthly_trend_from_events(events: list[dict]) -> list[dict]:
-    by_month: dict[str, list[int]] = defaultdict(list)
-    for event in events:
-        dt = _parse_event_date(str(event["date"]))
-        if not dt:
-            continue
-        by_month[_month_label(dt)].append(event["pct"])
-    if not by_month:
-        return []
-    ordered = sorted(by_month.items(), key=lambda item: datetime.strptime(item[0], "%b"))
-    return [{"month": month, "score": round(mean(scores))} for month, scores in ordered]
 
 
 def score_delta_from_events(events: list[dict]) -> int | None:
