@@ -60,8 +60,9 @@ class Settings(BaseSettings):
     # Vertex AI (Gemini summaries for student reports)
     vertex_enabled: bool = True
     google_cloud_project: str = ""
-    google_cloud_location: str = "us-central1"
-    vertex_model: str = "gemini-2.5-flash"
+    # Gemini 3.x Flash is global-only; keep us-central1 only for older 2.x models.
+    google_cloud_location: str = "global"
+    vertex_model: str = "gemini-3.6-flash"
     vertex_summary_cache_ttl: int = 300
     vertex_request_timeout_seconds: int = 12
     vertex_book_timeout_seconds: int = 180

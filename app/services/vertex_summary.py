@@ -68,6 +68,9 @@ _CREDENTIALS_HINT = (
     "(HOST_GCP_CREDENTIALS) or set GEMINI_API_KEY."
 )
 
+# Vertex / Gemini calls need cloud-platform; ADC refresh fails with invalid_scope without it.
+_GCP_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
 
 def _api_key() -> str:
     import os
@@ -82,9 +85,17 @@ def _api_key() -> str:
 def _credential_file_candidates() -> list[str]:
     import os
 
+    appdata = os.environ.get("APPDATA", "").strip()
+    windows_adc = (
+        os.path.join(appdata, "gcloud", "application_default_credentials.json")
+        if appdata
+        else ""
+    )
     return [
         os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
+        os.environ.get("HOST_GCP_CREDENTIALS", "").strip(),
         "/gcp/adc.json",
+        windows_adc,
         os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
     ]
 
@@ -95,17 +106,18 @@ def _resolve_credentials():
     from google.oauth2.credentials import Credentials
     import os
 
+    scopes = list(_GCP_SCOPES)
     for path in _credential_file_candidates():
         if not path or not os.path.isfile(path):
             continue
         try:
-            credentials, _ = google.auth.load_credentials_from_file(path)
+            credentials, _ = google.auth.load_credentials_from_file(path, scopes=scopes)
             return credentials
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not load Google credentials from %s: %s", path, exc)
 
     try:
-        credentials, _ = google.auth.default()
+        credentials, _ = google.auth.default(scopes=scopes)
         return credentials
     except DefaultCredentialsError:
         pass
@@ -128,6 +140,22 @@ def _resolve_credentials():
     return Credentials(token=token)
 
 
+def _vertex_location() -> str:
+    """Gemini 3.x Flash is served from global; regional locations 404."""
+    configured = (settings.google_cloud_location or "").strip() or "us-central1"
+    model = (settings.vertex_model or "").strip().lower()
+    if model.startswith("gemini-3") and configured not in {"global", "us-east5", "europe-west1"}:
+        # Prefer global for Gemini 3 family (gemini-3.6-flash etc.).
+        return "global"
+    return configured
+
+
+def reset_client() -> None:
+    """Drop cached client after credential / model env changes."""
+    global _client
+    _client = None
+
+
 def _get_client():
     global _client
     if _client is not None:
@@ -148,10 +176,17 @@ def _get_client():
     if credentials is None:
         raise RuntimeError(_CREDENTIALS_HINT)
 
+    location = _vertex_location()
+    logger.info(
+        "vertex_client_init project=%s location=%s model=%s",
+        project,
+        location,
+        settings.vertex_model,
+    )
     _client = genai.Client(
         vertexai=True,
         project=project,
-        location=settings.google_cloud_location,
+        location=location,
         credentials=credentials,
     )
     return _client

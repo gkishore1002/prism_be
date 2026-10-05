@@ -142,12 +142,15 @@ The backend container cannot use host `gcloud` login unless ADC is mounted.
 1. On the host: `gcloud auth application-default login`
 2. Set `HOST_GCP_CREDENTIALS` in `.env` or `.env.docker` to that JSON file:
    - Windows: `C:/Users/YOU/AppData/Roaming/gcloud/application_default_credentials.json`
-   - macOS/Linux: `~/.config/gcloud/application_default_credentials.json`
-3. Recreate the API container: `docker compose -f docker-compose.backend.yml up -d --force-recreate backend`
+   - macOS/Linux: `/home/YOU/.config/gcloud/application_default_credentials.json`
+3. For Gemini 3.x (`VERTEX_MODEL=gemini-3.6-flash`), set `GOOGLE_CLOUD_LOCATION=global`
+   (regional locations like `us-central1` return 404 for these models).
+4. Recreate the API container: `docker compose -f docker-compose.backend.yml up -d --force-recreate backend`
 
 Alternatively set `GEMINI_API_KEY` (Gemini Developer API) — no ADC mount needed.
 
 Then re-upload the textbook. Failed books are not retried automatically (the file is not stored).
+Restart the API process after changing Vertex credentials so the cached client is rebuilt.
 
 ---
 
