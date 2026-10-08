@@ -528,12 +528,8 @@ def get_teachers(
                 if batch.name in batch_names:
                     cohort_ids.update(_batch_student_ids(db, batch.id))
         cohort = [s for s in students if s.id in cohort_ids]
-        if center_ids is not None and not cohort:
-            continue
-        if not cohort and len(tutors) == 1:
-            cohort = students
+        # Include tutors even with an empty assessment cohort (new branch / no marks yet).
         scored = [s for s in cohort if s.health > 0]
-        avg_health = round(mean([s.health for s in scored])) if scored else 0
         primary_subject = tutor_assessments[0].subject if tutor_assessments else "General"
         result.append({
             "id": t.id,
@@ -729,6 +725,11 @@ def get_student_profile(db: Session, student_id: str) -> dict | None:
         return None
     institution_id = profile.user.institution_id
     events = recompute_svc.student_score_events(db, institution_id, student_id)
+    has_scores = len(events) > 0
+    # Never surface the legacy default "70 / good" when the student has no scored work.
+    health = int(profile.health) if has_scores else 0
+    readiness = int(profile.readiness) if has_scores else 0
+    status = profile.health_status if has_scores else "weak"
     return {
         "id": profile.id,
         "name": profile.user.name,
@@ -737,11 +738,11 @@ def get_student_profile(db: Session, student_id: str) -> dict | None:
         "batch": profile.batch,
         "centerId": profile.center_id,
         "academicYear": profile.academic_year,
-        "healthScore": profile.health,
-        "readiness": profile.readiness,
-        "improvement": _student_improvement_delta(db, institution_id, profile),
+        "healthScore": health,
+        "readiness": readiness,
+        "improvement": _student_improvement_delta(db, institution_id, profile) if has_scores else 0,
         "streak": len(events),
-        "status": profile.health_status,
+        "status": status,
     }
 
 
@@ -750,11 +751,13 @@ def get_student_health(db: Session, student_id: str) -> dict:
     if not profile:
         return {"overall": 0, "status": "weak", "trend": 0, "subjects": []}
     institution_id = profile.user.institution_id
-    delta = _student_improvement_delta(db, institution_id, profile)
-    subjects = _subjects_for_student(db, profile)
+    events = recompute_svc.student_score_events(db, institution_id, student_id)
+    has_scores = len(events) > 0
+    delta = _student_improvement_delta(db, institution_id, profile) if has_scores else 0
+    subjects = _subjects_for_student(db, profile) if has_scores else []
     return {
-        "overall": profile.health,
-        "status": profile.health_status,
+        "overall": int(profile.health) if has_scores else 0,
+        "status": profile.health_status if has_scores else "weak",
         "trend": delta,
         "subjects": subjects,
     }
@@ -764,17 +767,8 @@ def _subjects_for_student(db: Session, profile: StudentProfile) -> list[dict]:
     subjects_out = recompute_svc.subject_scores_for_student(
         db, profile.user.institution_id, profile.id
     )
-    if subjects_out:
-        return subjects_out
-    return [
-        {
-            "subjectId": "overall",
-            "subjectName": "Overall",
-            "health": profile.health,
-            "status": profile.health_status,
-            "trend": 0,
-        }
-    ]
+    # Never invent an "Overall" row from a cached/default health score.
+    return subjects_out
 
 
 def get_student_subjects(db: Session, student_id: str) -> list[dict]:

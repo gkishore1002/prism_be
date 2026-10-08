@@ -58,13 +58,155 @@ def list_marks_sessions(
                 "assessmentTitle": entry["assessmentTitle"],
                 "description": entry.get("description"),
                 "batch": entry["batch"],
+                "batchId": entry.get("batchId"),
                 "savedAt": entry["savedAt"],
                 "source": entry["source"],
+                "status": "published",
                 "entries": [],
+                "studentIds": set(),
             }
         sessions[sid]["entries"].append(entry)
+        sessions[sid]["studentIds"].add(entry["studentId"])
     ordered = sorted(sessions.values(), key=lambda s: s["savedAt"], reverse=True)
-    return ordered[:limit]
+    out: list[dict] = []
+    for session in ordered[:limit]:
+        student_ids = session.pop("studentIds")
+        out.append({**session, "studentCount": len(student_ids)})
+    return out
+
+
+def _pct_letter_grade(pct: float) -> str:
+    if pct >= 90:
+        return "A+"
+    if pct >= 80:
+        return "A"
+    if pct >= 70:
+        return "B+"
+    if pct >= 60:
+        return "B"
+    if pct >= 50:
+        return "C"
+    if pct >= 40:
+        return "D"
+    return "E"
+
+
+def _division_for_pct(pct: float) -> str:
+    if pct >= 75:
+        return "Distinction"
+    if pct >= 60:
+        return "First"
+    if pct >= 50:
+        return "Second"
+    if pct >= 35:
+        return "Third"
+    return "—"
+
+
+def _result_for_pct(pct: float) -> str:
+    return "Pass" if pct >= 35 else "Fail"
+
+
+def session_standings(
+    db: Session,
+    institution_id: str,
+    session_id: str,
+) -> dict:
+    """Consolidated per-student totals, % , grade, rank for one published marks session."""
+    rows = (
+        db.query(MarksEntry)
+        .filter(
+            MarksEntry.institution_id == institution_id,
+            MarksEntry.session_id == session_id,
+        )
+        .all()
+    )
+    if not rows:
+        raise ValueError("Marks session not found")
+
+    by_student: dict[str, dict] = {}
+    for row in rows:
+        bucket = by_student.get(row.student_id)
+        if bucket is None:
+            profile = db.get(StudentProfile, row.student_id)
+            user = profile.user if profile else None
+            email = user.email if user else ""
+            admission = email.split("@")[0] if email else row.student_id
+            bucket = {
+                "studentId": row.student_id,
+                "studentName": user.name if user else "Student",
+                "admissionNo": admission,
+                "totalScored": 0.0,
+                "totalMax": 0,
+                "subjects": 0,
+                "updatedAt": row.saved_at,
+            }
+            by_student[row.student_id] = bucket
+        bucket["totalScored"] += float(row.scored_marks or 0)
+        bucket["totalMax"] += int(row.max_marks or 0)
+        bucket["subjects"] += 1
+        if row.saved_at and row.saved_at > bucket["updatedAt"]:
+            bucket["updatedAt"] = row.saved_at
+
+    ranked: list[dict] = []
+    for bucket in by_student.values():
+        total_max = int(bucket["totalMax"])
+        total_scored = round(float(bucket["totalScored"]), 2)
+        percentage = pct(total_scored, total_max) if total_max > 0 else 0
+        ranked.append(
+            {
+                "studentId": bucket["studentId"],
+                "studentName": bucket["studentName"],
+                "admissionNo": bucket["admissionNo"],
+                "total": total_scored,
+                "maxTotal": total_max,
+                "percentage": percentage,
+                "grade": _pct_letter_grade(percentage),
+                "division": _division_for_pct(percentage),
+                "result": _result_for_pct(percentage),
+                "subjects": bucket["subjects"],
+                "updatedAt": bucket["updatedAt"],
+            }
+        )
+
+    ranked.sort(key=lambda r: (-r["percentage"], r["studentName"].casefold()))
+    for index, row in enumerate(ranked, start=1):
+        row["rank"] = index
+
+    first = rows[0]
+    return {
+        "sessionId": session_id,
+        "assessmentTitle": first.assessment_title,
+        "description": first.description,
+        "batch": first.batch_name,
+        "batchId": first.batch_id,
+        "savedAt": first.saved_at,
+        "source": first.source,
+        "status": "published",
+        "studentCount": len(ranked),
+        "students": ranked,
+    }
+
+
+def delete_session_student_marks(
+    db: Session,
+    institution_id: str,
+    session_id: str,
+    student_id: str,
+) -> None:
+    """Remove one student's marks from a published session (not the student account)."""
+    deleted = (
+        db.query(MarksEntry)
+        .filter(
+            MarksEntry.institution_id == institution_id,
+            MarksEntry.session_id == session_id,
+            MarksEntry.student_id == student_id,
+        )
+        .delete(synchronize_session=False)
+    )
+    if not deleted:
+        raise ValueError("No marks found for this student in the session")
+    db.commit()
 
 
 def _entry_dict(db: Session, row: MarksEntry) -> dict:

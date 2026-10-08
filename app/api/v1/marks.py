@@ -62,6 +62,37 @@ def list_marks_sessions(
     return marks_svc.list_marks_sessions(db, user.institution_id, batch_id=batch_id)
 
 
+@router.get("/sessions/{session_id}/standings")
+def get_marks_session_standings(
+    session_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> dict:
+    try:
+        return marks_svc.session_standings(db, user.institution_id, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.delete(
+    "/sessions/{session_id}/students/{student_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_marks_session_student(
+    session_id: str,
+    student_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> None:
+    """Remove marks rows for one student in a session (does not delete the student)."""
+    try:
+        marks_svc.delete_session_student_marks(
+            db, user.institution_id, session_id, student_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
 @router.get("/drafts")
 def list_marks_drafts(
     batch_id: str | None = Query(None),

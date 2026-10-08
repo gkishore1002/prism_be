@@ -48,11 +48,12 @@ class StudentProfile(Base):
     status: Mapped[str] = mapped_column(String(16), default="active")
     disable_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_csc_interaction_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    health: Mapped[int] = mapped_column(default=70)
-    health_status: Mapped[str] = mapped_column(String(16), default="good")
-    readiness: Mapped[int] = mapped_column(default=70)
+    # 0 until first scored assessment/marks — avoid fake "Good 70%" for new students.
+    health: Mapped[int] = mapped_column(default=0)
+    health_status: Mapped[str] = mapped_column(String(16), default="weak")
+    readiness: Mapped[int] = mapped_column(default=0)
     last_assessment: Mapped[str] = mapped_column(String(32), default="")
     critical_gaps: Mapped[int] = mapped_column(default=0)
-    improving: Mapped[bool] = mapped_column(default=True)
+    improving: Mapped[bool] = mapped_column(default=False)
 
     user: Mapped["User"] = relationship(back_populates="student_profile")

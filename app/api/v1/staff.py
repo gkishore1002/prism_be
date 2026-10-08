@@ -54,17 +54,19 @@ def _staff_out(
     assignment: StaffAssignment | None = None,
     academic_year_id: str | None = None,
 ) -> StaffOut:
+    assignment_status = assignment.status if assignment else None
     return StaffOut(
         id=user.id,
         name=user.name,
         email=user.email,
         is_owner=bool(getattr(user, "is_owner", False)),
-        active=True,
+        # Mirror year placement: inactive assignment means portal login is blocked.
+        active=assignment_status != "inactive",
         center_ids=assigned_center_ids(db, user.id),
         roles=parse_roles(user),
         assignment_id=assignment.id if assignment else None,
         assignment_center_id=assignment.center_id if assignment else None,
-        assignment_status=assignment.status if assignment else None,
+        assignment_status=assignment_status,
         assignment_start_date=assignment.start_date if assignment else None,
         assignment_end_date=assignment.end_date if assignment else None,
         academic_year_id=assignment.academic_year_id if assignment else academic_year_id,

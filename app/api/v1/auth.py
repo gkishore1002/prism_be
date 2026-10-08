@@ -155,8 +155,13 @@ def super_admin_to_out(super_admin: SuperAdmin) -> UserOut:
 
 
 def _role_options_for(user: User, db: Session | None = None) -> list[RoleOption]:
+    from app.services.staff_assignments import staff_login_block_reason
+
+    staff_blocked = bool(db and staff_login_block_reason(db, user))
     options: list[RoleOption] = []
     for r in get_allowed_roles(user):
+        if r in ("tutor", "admin") and staff_blocked:
+            continue
         if r == "admin":
             if is_organization_owner(user, "admin"):
                 options.append(
@@ -262,12 +267,19 @@ def _prepare_role_login(db: Session, user: User, role: str) -> None:
                 detail=login_block_message(profile, policy),
             )
     elif role in ("tutor", "admin"):
+        from app.services.staff_assignments import assert_staff_can_login
+
+        assert_staff_can_login(db, user)
         sync_staff_csc_notifications(db, user, role)
         db.commit()
 
 
-def _ensure_student_can_login(db: Session, user: User, role: str) -> None:
+def _ensure_role_can_login(db: Session, user: User, role: str) -> None:
     _prepare_role_login(db, user, role)
+
+
+# Backward-compatible alias used by older call sites / tests.
+_ensure_student_can_login = _ensure_role_can_login
 
 
 @router.get("/organizations", response_model=list[LoginOrganizationOut])
@@ -324,15 +336,24 @@ def login(body: LoginRequest, public_db: Session = Depends(get_public_db)) -> Lo
 
         allowed = get_allowed_roles(user)
         if len(allowed) > 1:
+            role_options = _role_options_for(user, tenant_db)
+            if not role_options:
+                from app.services.staff_assignments import assert_staff_can_login
+
+                assert_staff_can_login(tenant_db, user)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No available roles for this account.",
+                )
             return LoginRoleSelection(
                 email=email,
-                roles=_role_options_for(user, tenant_db),
+                roles=role_options,
                 institution_code=institution.code,
                 institution_name=institution.name,
             )
 
         role = allowed[0]
-        _ensure_student_can_login(tenant_db, user, role)
+        _ensure_role_can_login(tenant_db, user, role)
         return _login_authenticated_response(
             email=email,
             user=user,
@@ -367,7 +388,7 @@ def select_role(body: SelectRoleRequest, public_db: Session = Depends(get_public
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
     try:
-        _ensure_student_can_login(tenant_db, user, body.role)
+        _ensure_role_can_login(tenant_db, user, body.role)
         admin_portal = getattr(body, "admin_portal", None)
         return _login_authenticated_response(
             email=body.email,
@@ -417,7 +438,7 @@ def switch_role(
     if not institution:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
 
-    _ensure_student_can_login(db, user, body.role)
+    _ensure_role_can_login(db, user, body.role)
     return _login_authenticated_response(
         email=user.email,
         user=user,
@@ -430,16 +451,22 @@ def switch_role(
 @router.get("/me", response_model=UserOut)
 def me(
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
     public_db: Session = Depends(get_public_db),
     payload: dict = Depends(get_token_payload),
 ) -> UserOut:
-    if get_effective_role(payload, user) == SUPER_USER_ROLE:
+    role = get_effective_role(payload, user)
+    if role == SUPER_USER_ROLE:
         super_admin = public_db.get(SuperAdmin, payload["sub"])
         if super_admin:
             return super_admin_to_out(super_admin)
+    if role in ("tutor", "admin"):
+        from app.services.staff_assignments import assert_staff_can_login
+
+        assert_staff_can_login(db, user)
     return user_to_out(
         user,
-        role=get_effective_role(payload, user),
+        role=role,
         admin_portal=_current_admin_portal(payload),
     )
 

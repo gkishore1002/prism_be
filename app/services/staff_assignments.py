@@ -17,10 +17,34 @@ from app.services.enrollments import get_current_academic_year
 from app.services.user_roles import is_admin_account, is_tutor_account
 
 ASSIGNMENT_STATUSES = frozenset({"active", "completed", "transferred", "inactive"})
+# Placement statuses that revoke portal login for staff (tutor / admin).
+LOGIN_BLOCKED_ASSIGNMENT_STATUSES = frozenset({"inactive"})
+STAFF_LOGIN_INACTIVE_DETAIL = (
+    "Your staff account is inactive for the current academic year. Contact your administrator."
+)
 
 
 def _today() -> str:
     return date.today().isoformat()
+
+
+def staff_login_block_reason(db: Session, user: User) -> str | None:
+    """Return a login error detail when current-year staff placement is inactive."""
+    if not is_admin_account(user) and not is_tutor_account(user):
+        return None
+    year = get_current_academic_year(db, user.institution_id)
+    if not year:
+        return None
+    assignment = get_assignment_for_year(db, user.id, year.id)
+    if assignment and assignment.status in LOGIN_BLOCKED_ASSIGNMENT_STATUSES:
+        return STAFF_LOGIN_INACTIVE_DETAIL
+    return None
+
+
+def assert_staff_can_login(db: Session, user: User) -> None:
+    reason = staff_login_block_reason(db, user)
+    if reason:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
 
 
 def _new_id() -> str:

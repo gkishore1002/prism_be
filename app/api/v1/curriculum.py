@@ -1007,6 +1007,11 @@ def create_student(
         center_id=center_id,
         academic_year=body.academic_year,
         school_name=body.school_name,
+        health=0,
+        health_status="weak",
+        readiness=0,
+        critical_gaps=0,
+        improving=False,
     )
     db.add_all([new_user, profile])
     db.flush()
@@ -1062,8 +1067,12 @@ def create_student(
         set_as_current=True,
     )
     db.commit()
+    from app.services.analytics_recompute import recompute_student_profile
     from app.services.centers import sync_center_counts
 
+    # Persist health=0 / weak for brand-new students (no fake default 70).
+    recompute_student_profile(db, sid)
+    db.commit()
     sync_center_counts(db, user.institution_id, commit=True)
     profile = db.get(StudentProfile, sid)
     return _student_master_out(db, profile)
@@ -1124,20 +1133,101 @@ def delete_student(
     user: User = Depends(require_roles("tutor", "admin")),
     payload: dict = Depends(get_token_payload),
 ) -> None:
+    from sqlalchemy.exc import IntegrityError
+
     profile = db.get(StudentProfile, student_id)
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
     role = get_effective_role(payload, user)
     assert_can_access_student(db, user, role, profile)
-    db.query(BatchStudent).filter(BatchStudent.student_id == student_id).delete()
-    db.query(AssessmentSubmission).filter(AssessmentSubmission.student_id == student_id).delete()
     student_user = profile.user
-    db.delete(profile)
-    db.delete(student_user)
-    db.commit()
+    user_id = student_user.id if student_user else None
+    institution_id = user.institution_id
+
+    # Clear dependent rows before profile/user (FK integrity).
+    from app.models.assessment import (
+        AssessmentStudentReport,
+        ExamSession,
+        ExamViolation,
+        StudentGenomeReport,
+        StudentOverallReport,
+    )
+    from app.models.branch_access import UserCenterAccess
+    from app.models.csc import AssessmentAccessRequest, ReportCollectionLog
+    from app.models.enrollment import StudentEnrollment
+    from app.models.marks import MarksEntry
+    from app.models.notification import Notification
+
+    try:
+        # Break enrollment self-pointer before wiping enrollment rows.
+        profile.current_enrollment_id = None
+        db.flush()
+
+        db.query(ExamViolation).filter(ExamViolation.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        db.query(ExamSession).filter(ExamSession.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        db.query(AssessmentAccessRequest).filter(
+            AssessmentAccessRequest.student_id == student_id
+        ).delete(synchronize_session=False)
+        db.query(ReportCollectionLog).filter(ReportCollectionLog.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        # Reports reference submissions — delete reports first.
+        db.query(AssessmentStudentReport).filter(
+            AssessmentStudentReport.student_id == student_id
+        ).delete(synchronize_session=False)
+        db.query(StudentOverallReport).filter(StudentOverallReport.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        db.query(StudentGenomeReport).filter(StudentGenomeReport.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        db.query(MarksEntry).filter(MarksEntry.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        # Submissions reference enrollments — delete before enrollments.
+        db.query(AssessmentSubmission).filter(AssessmentSubmission.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        db.query(BatchStudent).filter(BatchStudent.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        db.query(StudentEnrollment).filter(StudentEnrollment.student_id == student_id).delete(
+            synchronize_session=False
+        )
+        if user_id:
+            # Other rows may reference this user as creator/collector.
+            db.query(UserCenterAccess).filter(UserCenterAccess.created_by == user_id).update(
+                {UserCenterAccess.created_by: None},
+                synchronize_session=False,
+            )
+            db.query(ReportCollectionLog).filter(
+                ReportCollectionLog.collected_by_user_id == user_id
+            ).delete(synchronize_session=False)
+            db.query(UserCenterAccess).filter(UserCenterAccess.user_id == user_id).delete(
+                synchronize_session=False
+            )
+            db.query(Notification).filter(Notification.user_id == user_id).delete(
+                synchronize_session=False
+            )
+
+        db.delete(profile)
+        if student_user:
+            db.delete(student_user)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Student cannot be deleted because related records still reference them.",
+        ) from exc
+
     from app.services.centers import sync_center_counts
 
-    sync_center_counts(db, user.institution_id, commit=True)
+    sync_center_counts(db, institution_id, commit=True)
 
 
 def _batch_out(db: Session, batch: Batch) -> TutorBatchOut:

@@ -296,6 +296,11 @@ def _create_student_row(
         center_id=center_id,
         academic_year=row.academic_year.strip() or "2025-26",
         school_name=row.school_name.strip() if row.school_name else None,
+        health=0,
+        health_status="weak",
+        readiness=0,
+        critical_gaps=0,
+        improving=False,
     )
     db.add_all([new_user, profile])
     db.flush()

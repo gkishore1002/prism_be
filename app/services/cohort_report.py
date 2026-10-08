@@ -372,7 +372,74 @@ def _enrich_latest_assessment(
         "assessmentId": latest.get("assessmentId"),
         "subjects": subjects,
         "overall": latest["overall"],
+        "rankInClass": latest.get("rankInClass"),
+        "totalInClass": latest.get("totalInClass"),
     }
+
+
+def _peer_exam_overall(
+    db: Session,
+    institution_id: str,
+    student_id: str,
+    *,
+    title: str,
+    date_label: str,
+) -> float | None:
+    from app.services.analytics_recompute import student_score_events
+
+    pcts: list[float] = []
+    for ev in student_score_events(db, institution_id, student_id):
+        ev_title = str(ev.get("title") or "Assessment")
+        ev_date = _parse_date_label(str(ev.get("date", "")))
+        if ev_title == title and ev_date == date_label:
+            pcts.append(float(ev["pct"]))
+    if not pcts:
+        return None
+    return round(mean(pcts), 1)
+
+
+def _enrich_exam_history_ranks(
+    db: Session,
+    institution_id: str,
+    exams: list[dict],
+    *,
+    batch_id: str | None,
+    student_id: str,
+) -> list[dict]:
+    """Attach class rank / total for each exam window from batch peer scores."""
+    if not exams:
+        return exams
+    peer_ids = _batch_student_ids(db, batch_id) if batch_id else [student_id]
+    if not peer_ids:
+        peer_ids = [student_id]
+    enriched: list[dict] = []
+    for exam in exams:
+        peer_scores: list[tuple[str, float]] = []
+        for sid in peer_ids:
+            overall = _peer_exam_overall(
+                db,
+                institution_id,
+                sid,
+                title=exam["title"],
+                date_label=exam["date"],
+            )
+            if overall is not None:
+                peer_scores.append((sid, overall))
+        peer_scores.sort(key=lambda item: (-item[1], item[0]))
+        rank = None
+        for index, (sid, _) in enumerate(peer_scores, start=1):
+            if sid == student_id:
+                rank = index
+                break
+        enriched.append(
+            {
+                **exam,
+                "rankInClass": rank,
+                "totalInClass": len(peer_scores) if peer_scores else None,
+                "grade": _pct_grade(exam["overall"]),
+            }
+        )
+    return enriched
 
 
 def _build_student_profile(
@@ -987,10 +1054,18 @@ def get_student_genome(db: Session, institution_id: str, student_id: str) -> dic
         genome["rank"] = rank
         total = max(cohort_report.get("meta", {}).get("batchStudentCount", total), 1)
 
-    genome["latestAssessment"] = _enrich_latest_assessment(
+    exam_history = _enrich_exam_history_ranks(
         db,
         institution_id,
         genome.get("examHistory") or [],
+        batch_id=batch.id if batch else None,
+        student_id=student_id,
+    )
+    genome["examHistory"] = exam_history
+    genome["latestAssessment"] = _enrich_latest_assessment(
+        db,
+        institution_id,
+        exam_history,
         batch_id=batch.id if batch else None,
     )
 
