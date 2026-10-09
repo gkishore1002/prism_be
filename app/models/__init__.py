@@ -21,6 +21,7 @@ from app.models.deployment import SystemInitialization
 from app.models.super_admin import SuperAdmin
 from app.models.enrollment import AcademicYear, StudentEnrollment
 from app.models.staff_assignment import StaffAssignment
+from app.models.llm_usage import LlmUsageDaily
 from app.models.user import StudentProfile, User
 
 __all__ = [
@@ -60,4 +61,5 @@ __all__ = [
     "AcademicYear",
     "StudentEnrollment",
     "StaffAssignment",
+    "LlmUsageDaily",
 ]

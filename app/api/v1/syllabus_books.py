@@ -87,7 +87,10 @@ def _extract_in_background(
     schema_name: str | None,
     institution_id: str,
 ) -> None:
+    from app.services.llm_usage import set_current_institution_id
+
     tokens = set_tenant_context(schema_name=schema_name or "public", institution_id=institution_id)
+    set_current_institution_id(institution_id)
     db = open_tenant_db(schema_name)
     try:
         book = db.get(SyllabusBook, book_id)
@@ -97,6 +100,7 @@ def _extract_in_background(
     except Exception:  # noqa: BLE001
         logger.exception("syllabus_book_background_failed book_id=%s", book_id)
     finally:
+        set_current_institution_id(None)
         close_tenant_db(db)
         safe_reset_tenant_context(tokens)
 

@@ -237,6 +237,52 @@ def ensure_institution_policies(engine: Engine) -> None:
             conn.execute(text("ALTER TABLE institutions ADD COLUMN policies_json TEXT NOT NULL DEFAULT '{}'"))
 
 
+def ensure_llm_usage_daily(engine: Engine) -> None:
+    if inspect(engine).has_table("llm_usage_daily"):
+        return
+    inst_fk = "public.institutions(id)" if engine.dialect.name == "postgresql" else "institutions(id)"
+    table = "public.llm_usage_daily" if engine.dialect.name == "postgresql" else "llm_usage_daily"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE {table} (
+                    id VARCHAR(32) PRIMARY KEY,
+                    institution_id VARCHAR(32) NOT NULL REFERENCES {inst_fk},
+                    usage_date VARCHAR(16) NOT NULL,
+                    service VARCHAR(64) NOT NULL DEFAULT 'other',
+                    model VARCHAR(128) NOT NULL DEFAULT '',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    call_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at VARCHAR(32) NOT NULL DEFAULT ''
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_llm_usage_daily_institution_id ON {table} (institution_id)"
+            )
+        )
+        conn.execute(
+            text(f"CREATE INDEX IF NOT EXISTS ix_llm_usage_daily_usage_date ON {table} (usage_date)")
+        )
+        # Unique per day/service/model (portable across sqlite/postgres)
+        try:
+            conn.execute(
+                text(
+                    f"""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_usage_daily_inst_date_svc_model
+                    ON {table} (institution_id, usage_date, service, model)
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def ensure_center_active(engine: Engine) -> None:
     if not inspect(engine).has_table("centers"):
         return
@@ -1236,6 +1282,7 @@ def run_migrations(engine: Engine) -> None:
     ensure_notification_user_fields(engine)
     ensure_institution_is_active(engine)
     ensure_institution_policies(engine)
+    ensure_llm_usage_daily(engine)
     ensure_center_active(engine)
     ensure_audit_logs(engine)
     ensure_student_center_index(engine)

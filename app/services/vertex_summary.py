@@ -1,6 +1,7 @@
 """Vertex AI (Gemini) summaries for student reports."""
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -10,11 +11,22 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Any, Callable
 
 from app.core.config import settings
+from app.services.llm_usage import (
+    SERVICE_ASSESSMENT_REPORT,
+    SERVICE_STUDENT_GENOME,
+    SERVICE_STUDENT_REPORT,
+)
 
 logger = logging.getLogger(__name__)
 
 _CACHE: dict[str, tuple[float, str]] = {}
 _client = None
+
+
+def _pool_submit(pool: ThreadPoolExecutor, fn: Callable[..., Any], *args: Any, **kwargs: Any):
+    """Submit work with the caller's ContextVar state (institution_id for token usage)."""
+    ctx = contextvars.copy_context()
+    return pool.submit(lambda: ctx.run(fn, *args, **kwargs))
 
 
 def _cache_get(key: str) -> str | None:
@@ -192,13 +204,18 @@ def _get_client():
     return _client
 
 
-def _generate(prompt: str, *, cache_key: str) -> str | None:
+def _generate(prompt: str, *, cache_key: str, service: str = "report_summary") -> str | None:
     if not settings.vertex_enabled:
         return None
 
     cached = _cache_get(cache_key)
     if cached:
         return cached
+
+    from app.services import llm_usage
+
+    # Capture before the worker thread — ContextVar is not inherited otherwise.
+    institution_id = llm_usage.get_current_institution_id()
 
     def _call_vertex() -> str | None:
         from google.genai import types
@@ -214,6 +231,14 @@ def _generate(prompt: str, *, cache_key: str) -> str | None:
             ),
         )
         text = (response.text or "").strip()
+        llm_usage.record_from_response(
+            response,
+            service=service,
+            prompt_text=prompt,
+            completion_text=text or "",
+            model=settings.vertex_model,
+            institution_id=institution_id,
+        )
         if not text:
             return None
         _cache_set(cache_key, text)
@@ -222,7 +247,7 @@ def _generate(prompt: str, *, cache_key: str) -> str | None:
     timeout = max(1, settings.vertex_request_timeout_seconds)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(_call_vertex).result(timeout=timeout)
+            return _pool_submit(pool, _call_vertex).result(timeout=timeout)
     except FuturesTimeoutError:
         logger.warning("Vertex summary timed out after %ss (cache_key=%s)", timeout, cache_key)
         return None
@@ -246,8 +271,8 @@ def generate_pair_parallel(
     deadline = time.monotonic() + timeout
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        en_future = pool.submit(en_fn, context)
-        ta_future = pool.submit(ta_fn, context)
+        en_future = _pool_submit(pool, en_fn, context)
+        ta_future = _pool_submit(pool, ta_fn, context)
         en: str | None = None
         ta: str | None = None
         try:
@@ -277,7 +302,12 @@ def warm_student_report_summaries(context: dict[str, Any]) -> None:
     if not settings.vertex_enabled:
         return
 
+    from app.services import llm_usage
+
+    institution_id = llm_usage.get_current_institution_id()
+
     def _run() -> None:
+        llm_usage.set_current_institution_id(institution_id)
         try:
             generate_pair_parallel(
                 generate_student_report_summary,
@@ -286,6 +316,8 @@ def warm_student_report_summaries(context: dict[str, Any]) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Background overall-report summary warm failed: %s", exc)
+        finally:
+            llm_usage.set_current_institution_id(None)
 
     import threading
 
@@ -301,7 +333,7 @@ Assessment result data (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 2–3 sentences covering: score on this assessment, performance vs class average if available, one strength, and one focus area from weak topics. Be specific to THIS assessment only — do not discuss overall career or unrelated subjects. Plain text only."""
-    return _generate(prompt, cache_key=key)
+    return _generate(prompt, cache_key=key, service=SERVICE_ASSESSMENT_REPORT)
 
 
 def generate_assessment_report_summary_ta(context: dict[str, Any]) -> str | None:
@@ -313,7 +345,7 @@ Assessment result data (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 2–3 sentences in Tamil covering: score on this assessment, performance vs class average if available, one strength, and one focus area. Plain Tamil text only — no English, no markdown."""
-    return _generate(prompt, cache_key=key)
+    return _generate(prompt, cache_key=key, service=SERVICE_ASSESSMENT_REPORT)
 
 
 def generate_student_report_summary_ta(context: dict[str, Any]) -> str | None:
@@ -325,7 +357,7 @@ Student data (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 2–3 sentences in Tamil for parents and tutors. Cover overall performance, trends, and top priorities. Plain Tamil only — no English, no bullet points, no markdown."""
-    return _generate(prompt, cache_key=key)
+    return _generate(prompt, cache_key=key, service=SERVICE_STUDENT_REPORT)
 
 
 def generate_student_genome_narrative_ta(context: dict[str, Any]) -> str | None:
@@ -337,7 +369,7 @@ Student genome metrics (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 3–4 short paragraphs in Tamil covering: overall standing, subject strengths and weaknesses, trend, and projected performance. Plain Tamil only — no English, no bullet points, no markdown."""
-    return _generate(prompt, cache_key=key)
+    return _generate(prompt, cache_key=key, service=SERVICE_STUDENT_GENOME)
 
 
 def generate_student_report_summary(context: dict[str, Any]) -> str | None:
@@ -349,7 +381,7 @@ Student data (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 2–3 sentences in plain English for parents and tutors. Cover overall performance across all subjects and assessments to date, trends, and top priorities. Be encouraging but honest. Do not use bullet points or markdown."""
-    return _generate(prompt, cache_key=key)
+    return _generate(prompt, cache_key=key, service=SERVICE_STUDENT_REPORT)
 
 
 def generate_student_genome_narrative(context: dict[str, Any]) -> str | None:
@@ -361,7 +393,7 @@ Student genome metrics (JSON):
 {json.dumps(context, indent=2, default=str)}
 
 Write 3–4 short paragraphs covering: overall standing and rank, subject strengths and weaknesses, trend and consistency, recovery/resilience, and projected next performance. Use warm, professional language suitable for tutors and parents. Plain text only — no bullet points or markdown."""
-    return _generate(prompt, cache_key=key)
+    return _generate(prompt, cache_key=key, service=SERVICE_STUDENT_GENOME)
 
 
 def parse_llm_json(text: str) -> Any:
@@ -389,9 +421,15 @@ def _generate_flexible(
     max_output_tokens: int,
     temperature: float,
     json_mode: bool,
+    service: str = "other",
+    prompt_hint: str = "",
 ) -> str | None:
     if not settings.vertex_enabled:
         return None
+
+    from app.services import llm_usage
+
+    institution_id = llm_usage.get_current_institution_id()
 
     def _call_vertex() -> str | None:
         from google.genai import types
@@ -410,11 +448,25 @@ def _generate_flexible(
             config=types.GenerateContentConfig(**config_kwargs),
         )
         text = (response.text or "").strip()
+        hint = prompt_hint
+        if not hint:
+            if isinstance(contents, str):
+                hint = contents
+            else:
+                hint = str(contents)[:2000]
+        llm_usage.record_from_response(
+            response,
+            service=service,
+            prompt_text=hint,
+            completion_text=text or "",
+            model=settings.vertex_model,
+            institution_id=institution_id,
+        )
         return text or None
 
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(_call_vertex).result(timeout=timeout)
+            return _pool_submit(pool, _call_vertex).result(timeout=timeout)
     except FuturesTimeoutError:
         logger.warning("Vertex JSON generation timed out after %ss", timeout)
         return None
@@ -462,6 +514,8 @@ def extract_book_outline(
                 max_output_tokens=8192,
                 temperature=0.1,
                 json_mode=True,
+                service="book_outline",
+                prompt_hint=instructions,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("book_outline_multimodal_failed_fallback_text: %s", exc)
@@ -478,6 +532,8 @@ def extract_book_outline(
             max_output_tokens=8192,
             temperature=0.1,
             json_mode=True,
+            service="book_outline",
+            prompt_hint=instructions,
         )
     if not response_text:
         raise RuntimeError("Vertex AI did not return a book outline")
@@ -537,6 +593,8 @@ Rules:
         max_output_tokens=4096,
         temperature=0.1,
         json_mode=True,
+        service="topic_map",
+        prompt_hint=prompt[:2000],
     )
     if not response_text:
         return _heuristic_topic_map(outline, questions)
@@ -596,4 +654,5 @@ def _heuristic_topic_map(
             }
         )
     return mappings
+
 
