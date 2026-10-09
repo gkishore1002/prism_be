@@ -63,6 +63,8 @@ class SyllabusBook(Base):
     filename: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(16), default="analyzing")
     analysis_json: Mapped[str] = mapped_column(Text, default="{}")
+    # Extracted textbook text kept for token-lean MCQ generation (not the raw PDF).
+    source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[str] = mapped_column(String(32), default="")

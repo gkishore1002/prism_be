@@ -514,6 +514,7 @@ def branch_context(
             code=institution.code if show_org_code else None,
             type=institution.type,
             board_ids=from_json_list(institution.board_ids),
+            ai_mcq_from_books=bool(getattr(institution, "ai_mcq_from_books", False)),
         ),
         role=role,  # type: ignore[arg-type]
         is_owner=owner,

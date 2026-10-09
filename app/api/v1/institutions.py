@@ -49,6 +49,7 @@ def _institution_out(inst: Institution, *, include_code: bool = False) -> Instit
         code=inst.code if include_code else None,
         type=inst.type,
         board_ids=from_json_list(inst.board_ids),
+        ai_mcq_from_books=bool(getattr(inst, "ai_mcq_from_books", False)),
     )
 
 

@@ -120,7 +120,12 @@ def patch_platform_organization(
     public_db: Session = Depends(get_public_db),
     _: User = Depends(_require_super_user),
 ) -> PlatformOrganizationOut:
-    if body.name is None and body.type is None and body.is_active is None:
+    if (
+        body.name is None
+        and body.type is None
+        and body.is_active is None
+        and body.ai_mcq_from_books is None
+    ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No changes provided")
     return update_organization(
         public_db,
@@ -128,4 +133,5 @@ def patch_platform_organization(
         name=body.name,
         org_type=body.type,
         is_active=body.is_active,
+        ai_mcq_from_books=body.ai_mcq_from_books,
     )

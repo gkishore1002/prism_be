@@ -25,7 +25,15 @@ from app.core.deps import get_current_user, get_db, require_roles
 from app.core.routing import CamelCaseAPIRoute
 from app.models.content import SyllabusBook
 from app.models.user import User
+from app.models.institution import Institution
 from app.schemas import (
+    ApproveMcqsRequest,
+    ApproveMcqsResponse,
+    GenerateMcqsRequest,
+    GenerateMcqsResponse,
+    GeneratedMcqOut,
+    McqTopicSelection,
+    QuestionCreate,
     SyllabusBookOut,
     SyllabusOutlineApprove,
     SyllabusOutlineUpdate,
@@ -77,7 +85,17 @@ def _book_out(book: SyllabusBook, *, include_json: bool = False) -> SyllabusBook
         created_at=book.created_at,
         chapter_count=chapter_count,
         topic_count=topic_count,
+        has_source_text=bool((getattr(book, "source_text", None) or "").strip()),
     )
+
+
+def _require_ai_mcq_premium(db: Session, institution_id: str) -> None:
+    inst = db.get(Institution, institution_id)
+    if not inst or not bool(getattr(inst, "ai_mcq_from_books", False)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="AI MCQ generation from books is a premium feature. Ask your platform admin to enable it.",
+        )
 
 
 def _extract_in_background(
@@ -87,7 +105,10 @@ def _extract_in_background(
     schema_name: str | None,
     institution_id: str,
 ) -> None:
+    from app.services.llm_usage import set_current_institution_id
+
     tokens = set_tenant_context(schema_name=schema_name or "public", institution_id=institution_id)
+    set_current_institution_id(institution_id)
     db = open_tenant_db(schema_name)
     try:
         book = db.get(SyllabusBook, book_id)
@@ -97,6 +118,7 @@ def _extract_in_background(
     except Exception:  # noqa: BLE001
         logger.exception("syllabus_book_background_failed book_id=%s", book_id)
     finally:
+        set_current_institution_id(None)
         close_tenant_db(db)
         safe_reset_tenant_context(tokens)
 
@@ -355,3 +377,191 @@ def map_question_topics(
             )
 
     return TopicMapResponse(mappings=mappings, book_ids=book_ids, used_heuristic=used_heuristic)
+
+
+def _resolve_mcq_selections(body: GenerateMcqsRequest) -> list[McqTopicSelection]:
+    """Build unique chapter/topic pairs from multi-select and/or legacy fields."""
+    seen: set[tuple[str, str]] = set()
+    out: list[McqTopicSelection] = []
+    for item in body.selections or []:
+        chapter = (item.chapter or "").strip()
+        topic = (item.topic or "").strip()
+        if not chapter or not topic:
+            continue
+        key = (chapter.lower(), topic.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(McqTopicSelection(chapter=chapter, topic=topic))
+    if not out:
+        chapter = (body.chapter or "").strip()
+        topic = (body.topic or "").strip()
+        if chapter and topic:
+            out.append(McqTopicSelection(chapter=chapter, topic=topic))
+    return out[:20]
+
+
+def _distribute_counts(total: int, buckets: int) -> list[int]:
+    """Spread ``total`` questions across ``buckets`` (at least 1 each when possible)."""
+    if buckets <= 0:
+        return []
+    total = max(1, int(total))
+    if total < buckets:
+        # Prefer one question on the first ``total`` selections.
+        return [1 if i < total else 0 for i in range(buckets)]
+    base, rem = divmod(total, buckets)
+    return [base + (1 if i < rem else 0) for i in range(buckets)]
+
+
+@router.post("/syllabus-books/{book_id}/generate-mcqs", response_model=GenerateMcqsResponse)
+def generate_mcqs_from_book(
+    book_id: str,
+    body: GenerateMcqsRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> GenerateMcqsResponse:
+    """Premium: generate MCQ preview from topic-scoped book excerpts (not persisted)."""
+    _require_ai_mcq_premium(db, user.institution_id)
+    if not settings.vertex_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Vertex AI is disabled. Enable VERTEX to generate MCQs.",
+        )
+    selections = _resolve_mcq_selections(body)
+    if not selections:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Select at least one chapter and topic.",
+        )
+    book = _require_analyzed_book(db, book_id, user.institution_id)
+    source = (getattr(book, "source_text", None) or "").strip()
+    if not source:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This book has no stored text for generation. Re-upload the PDF/TXT to enable AI MCQs.",
+        )
+
+    per_topic_counts = _distribute_counts(body.count, len(selections))
+    questions: list[GeneratedMcqOut] = []
+    for selection, n in zip(selections, per_topic_counts, strict=True):
+        if n <= 0:
+            continue
+        excerpt = books_svc.slice_topic_excerpt(
+            source, chapter=selection.chapter, topic=selection.topic
+        )
+        if not excerpt:
+            continue
+        raw_questions = vertex_svc.generate_mcqs_from_book_text(
+            excerpt=excerpt,
+            chapter=selection.chapter,
+            topic=selection.topic,
+            difficulty=body.difficulty,
+            count=n,
+            avoid_stems=body.avoid_stems,
+        )
+        for q in raw_questions or []:
+            questions.append(
+                GeneratedMcqOut(
+                    text=q["text"],
+                    option_a=q["optionA"],
+                    option_b=q["optionB"],
+                    option_c=q["optionC"],
+                    option_d=q["optionD"],
+                    correct_answer=q["correctAnswer"],  # type: ignore[arg-type]
+                    marks=int(q.get("marks") or 1),
+                    difficulty=q.get("difficulty") or body.difficulty,  # type: ignore[arg-type]
+                    chapter=selection.chapter,
+                    topic=selection.topic,
+                )
+            )
+
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI did not return usable MCQs. Try again or adjust chapters/topics.",
+        )
+
+    label_chapter = ", ".join(dict.fromkeys(s.chapter for s in selections))
+    label_topic = ", ".join(dict.fromkeys(s.topic for s in selections))
+    return GenerateMcqsResponse(
+        book_id=book.id,
+        board=book.board,
+        grade=book.grade,
+        subject=book.subject,
+        chapter=label_chapter[:255],
+        topic=label_topic[:255],
+        difficulty=body.difficulty,
+        questions=questions,
+        selections=selections,
+    )
+
+
+@router.post(
+    "/syllabus-books/{book_id}/approve-mcqs",
+    response_model=ApproveMcqsResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def approve_mcqs_from_book(
+    book_id: str,
+    body: ApproveMcqsRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("tutor", "admin")),
+) -> ApproveMcqsResponse:
+    """Premium: save edited MCQ preview into the question bank (no Vertex call)."""
+    _require_ai_mcq_premium(db, user.institution_id)
+    book = _require_analyzed_book(db, book_id, user.institution_id)
+    from app.api.v1.questions import _persist_question
+
+    question_ids: list[str] = []
+    for idx, item in enumerate(body.questions, start=1):
+        if not (item.text or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Question {idx}: text is required",
+            )
+        if not (item.option_a or "").strip() or not (item.option_b or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Question {idx}: options A and B are required",
+            )
+        if item.correct_answer not in {"A", "B", "C", "D"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Question {idx}: correct answer must be A, B, C, or D",
+            )
+        chapter = (item.chapter or body.chapter or "").strip()
+        topic = (item.topic or body.topic or "").strip()
+        if not chapter or not topic:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Question {idx}: chapter and topic are required",
+            )
+        create = QuestionCreate(
+            board=book.board,
+            grade=book.grade,
+            subject=book.subject,
+            chapter=chapter,
+            topic=topic,
+            text=item.text.strip(),
+            difficulty=item.difficulty or body.difficulty,
+            marks=max(1, min(5, int(item.marks or 1))),
+            question_type="mcq",
+            option_a=item.option_a.strip(),
+            option_b=item.option_b.strip(),
+            option_c=(item.option_c or "").strip() or None,
+            option_d=(item.option_d or "").strip() or None,
+            correct_answer=item.correct_answer,
+        )
+        question = _persist_question(
+            db,
+            user.institution_id,
+            create,
+            question_status=body.status,
+        )
+        question_ids.append(question.id)
+    db.commit()
+    return ApproveMcqsResponse(
+        saved=len(question_ids),
+        question_ids=question_ids,
+        status=body.status,
+    )

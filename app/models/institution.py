@@ -18,6 +18,8 @@ class Institution(Base):
     schema_name: Mapped[str] = mapped_column(String(128), default="public")
     type: Mapped[str] = mapped_column(String(32), default="coaching")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Super Admin–only premium: AI MCQ generation from syllabus books.
+    ai_mcq_from_books: Mapped[bool] = mapped_column(Boolean, default=False)
     board_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON array
     policies_json: Mapped[str] = mapped_column(Text, default="{}")
 

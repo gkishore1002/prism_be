@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 INLINE_PDF_CAP = 20 * 1024 * 1024
 SUPPORTED_BOOK_EXTENSIONS = {"pdf", "txt"}
+# Persist enough text for later topic-scoped MCQ excerpts (not sent to Vertex in full).
+SOURCE_TEXT_STORE_CAP = 500_000
+MCQ_EXCERPT_TARGET = 5_000
+MCQ_EXCERPT_HARD_MAX = 8_000
 
 
 def normalize_grade(grade: str) -> str:
@@ -261,11 +265,54 @@ def persist_outline_to_curriculum(
     return added
 
 
+def slice_topic_excerpt(
+    source_text: str,
+    *,
+    chapter: str,
+    topic: str,
+    target_chars: int = MCQ_EXCERPT_TARGET,
+    hard_max: int = MCQ_EXCERPT_HARD_MAX,
+) -> str:
+    """Return a small text window around chapter/topic for low-token MCQ generation."""
+    text = (source_text or "").strip()
+    if not text:
+        return ""
+    hard_max = max(1_000, min(hard_max, MCQ_EXCERPT_HARD_MAX))
+    target = max(1_000, min(target_chars, hard_max))
+    lower = text.lower()
+    chapter_key = _fold_label(chapter)
+    topic_key = _fold_label(topic)
+
+    def _find(needle: str) -> int:
+        if not needle:
+            return -1
+        return lower.find(needle)
+
+    anchor = _find(topic_key)
+    if anchor < 0:
+        anchor = _find(chapter_key)
+    if anchor < 0:
+        # Middle slice when titles are not present in raw text.
+        mid = max(0, (len(text) - target) // 2)
+        return text[mid : mid + target]
+
+    half = target // 2
+    start = max(0, anchor - half)
+    end = min(len(text), start + target)
+    start = max(0, end - target)
+    excerpt = text[start:end].strip()
+    return excerpt[:hard_max]
+
+
 def analyze_book(db: Session, book: SyllabusBook, content: bytes, filename: str) -> None:
     try:
         pdf_bytes, pdf_text = prepare_book_for_llm(content, filename)
         if not pdf_bytes and not (pdf_text or "").strip():
             raise RuntimeError("Could not read any text from the uploaded file. Use PDF or TXT.")
+        # Keep extracted text for later MCQ generation (token-lean excerpts only).
+        stored = (pdf_text or "").strip()
+        if stored:
+            book.source_text = stored[:SOURCE_TEXT_STORE_CAP]
         outline = vertex_svc.extract_book_outline(
             subject_name=book.subject,
             pdf_bytes=pdf_bytes,

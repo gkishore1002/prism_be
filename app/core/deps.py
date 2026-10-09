@@ -91,6 +91,9 @@ def get_db(
                         schema_name, institution_id = resolved
 
     set_request_tenant_context(request, schema_name=schema_name, institution_id=institution_id)
+    from app.services.llm_usage import set_current_institution_id
+
+    set_current_institution_id(institution_id)
 
     if schema_name and institution_id:
         db = open_tenant_db(schema_name)
@@ -103,6 +106,7 @@ def get_db(
         from app.services.branch_access import clear_request_admin_scope
 
         clear_request_admin_scope()
+        set_current_institution_id(None)
         close_tenant_db(db)
 
 

@@ -372,9 +372,13 @@ def execute_report_job(
     batch_id: str | None = None,
 ) -> dict[str, Any]:
     """Tenant-aware runner used by FastAPI BackgroundTasks."""
+    from app.services.llm_usage import set_current_institution_id
+
     tokens = set_tenant_context(
         schema_name=schema_name or "public", institution_id=institution_id
     )
+    # Attribute Vertex tokens from report jobs to this organization.
+    set_current_institution_id(institution_id)
     db = open_tenant_db(schema_name)
     try:
         if kind == "assessment_completed":
@@ -420,6 +424,7 @@ def execute_report_job(
         return {"error": "report_job_failed"}
     finally:
         close_tenant_db(db)
+        set_current_institution_id(None)
         safe_reset_tenant_context(tokens)
 
 

@@ -32,6 +32,7 @@ def organization_out(inst: Institution, *, admin_count: int = 0) -> PlatformOrga
         schema_name=getattr(inst, "schema_name", None) or "public",
         type=inst.type,
         is_active=bool(getattr(inst, "is_active", True)),
+        ai_mcq_from_books=bool(getattr(inst, "ai_mcq_from_books", False)),
         admin_count=admin_count,
     )
 
@@ -150,6 +151,7 @@ def update_organization(
     name: str | None = None,
     org_type: str | None = None,
     is_active: bool | None = None,
+    ai_mcq_from_books: bool | None = None,
 ) -> PlatformOrganizationOut:
     institution = lookup_institution_by_code(public_db, code)
     if not institution:
@@ -160,6 +162,8 @@ def update_organization(
         institution.type = org_type.strip()
     if is_active is not None:
         institution.is_active = is_active
+    if ai_mcq_from_books is not None:
+        institution.ai_mcq_from_books = ai_mcq_from_books
     public_db.commit()
     public_db.refresh(institution)
     return organization_out(institution)

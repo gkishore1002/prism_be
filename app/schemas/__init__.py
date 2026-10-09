@@ -48,6 +48,7 @@ class PlatformOrganizationOut(CamelModel):
     schema_name: str
     type: str
     is_active: bool = True
+    ai_mcq_from_books: bool = False
     admin_count: int = 0
 
 
@@ -81,6 +82,7 @@ class PlatformOrganizationUpdate(CamelModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     type: str | None = Field(default=None, min_length=1, max_length=32)
     is_active: bool | None = None
+    ai_mcq_from_books: bool | None = None
 
 
 class PlatformSuperAdminOut(CamelModel):
@@ -170,6 +172,7 @@ class InstitutionOut(CamelModel):
     code: str | None = None
     type: str
     board_ids: list[str] = []
+    ai_mcq_from_books: bool = False
 
 
 class CenterOut(CamelModel):
@@ -723,6 +726,66 @@ class SyllabusBookOut(CamelModel):
     created_at: str = ""
     chapter_count: int = 0
     topic_count: int = 0
+    has_source_text: bool = False
+
+
+class McqTopicSelection(CamelModel):
+    chapter: str = Field(min_length=1, max_length=255)
+    topic: str = Field(min_length=1, max_length=255)
+
+
+class GenerateMcqsRequest(CamelModel):
+    """Generate MCQs for one or more chapter/topic pairs.
+
+    Prefer ``selections`` for multi-select. Legacy single ``chapter`` + ``topic``
+    still works when ``selections`` is empty.
+    """
+
+    chapter: str = Field(default="", max_length=255)
+    topic: str = Field(default="", max_length=255)
+    selections: list[McqTopicSelection] = Field(default_factory=list, max_length=20)
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+    count: int = Field(default=5, ge=1, le=30)
+    avoid_stems: list[str] = Field(default_factory=list, max_length=5)
+
+
+class GeneratedMcqOut(CamelModel):
+    text: str
+    option_a: str
+    option_b: str
+    option_c: str
+    option_d: str
+    correct_answer: Literal["A", "B", "C", "D"]
+    marks: int = 1
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+    chapter: str = ""
+    topic: str = ""
+
+
+class GenerateMcqsResponse(CamelModel):
+    book_id: str
+    board: str
+    grade: str
+    subject: str
+    chapter: str
+    topic: str
+    difficulty: Literal["easy", "medium", "hard"]
+    questions: list[GeneratedMcqOut]
+    selections: list[McqTopicSelection] = Field(default_factory=list)
+
+
+class ApproveMcqsRequest(CamelModel):
+    chapter: str = Field(default="", max_length=255)
+    topic: str = Field(default="", max_length=255)
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+    status: Literal["draft", "active"] = "draft"
+    questions: list[GeneratedMcqOut] = Field(min_length=1, max_length=30)
+
+
+class ApproveMcqsResponse(CamelModel):
+    saved: int
+    question_ids: list[str] = Field(default_factory=list)
+    status: Literal["draft", "active"]
 
 
 class SyllabusChapterIn(CamelModel):
